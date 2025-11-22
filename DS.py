@@ -20,7 +20,6 @@ from torch.utils.data import Dataset, DataLoader
 import warnings
 from typing import Dict, List, Tuple
 
-
 warnings.filterwarnings('ignore')
 
 plt.rcParams['font.sans-serif'] = ['SimHei']
@@ -97,6 +96,16 @@ class EfficientMarketDataProcessor:
 
             print(f"数据下载完成，共{len(data)}条记录")
 
+            # 修复：处理MultiIndex列名问题
+            if isinstance(data.columns, pd.MultiIndex):
+                print("检测到MultiIndex列，进行扁平化处理...")
+                # 方法1：直接使用第一层列名
+                data.columns = data.columns.get_level_values(0)
+                # 或者方法2：重命名列
+                # data = data.rename(columns={col: col[0] for col in data.columns})
+
+            print(f"处理后的列名: {data.columns.tolist()}")
+
             try:
                 with open(cache_file, 'wb') as f:
                     pickle.dump(data, f)
@@ -125,6 +134,15 @@ class EfficientMarketDataProcessor:
         """
         print("向量化计算技术指标...")
         result_df = df.copy()
+
+        # 确保价格数据是Series而不是DataFrame
+        if isinstance(result_df['Close'], pd.DataFrame):
+            print("检测到Close是DataFrame，转换为Series...")
+            # 如果有多个列，取第一列
+            if len(result_df['Close'].columns) > 1:
+                result_df['Close'] = result_df['Close'].iloc[:, 0]
+            else:
+                result_df['Close'] = result_df['Close'].squeeze()
 
         # 基础收益率
         result_df['returns'] = result_df['Close'].pct_change()
@@ -164,9 +182,21 @@ class EfficientMarketDataProcessor:
         result_df['Momentum_5'] = result_df['Close'] / result_df['Close'].shift(5) - 1
         result_df['Momentum_10'] = result_df['Close'] / result_df['Close'].shift(10) - 1
 
-        # 价格位置相对布林带
-        result_df['BB_position'] = (result_df['Close'] - result_df['BB_lower_20']) / (
-                    result_df['BB_upper_20'] - result_df['BB_lower_20'])
+        # 修复：确保布林带位置计算正确
+        # 价格位置相对布林带 - 修正版本
+        if 'BB_upper_20' in result_df.columns and 'BB_lower_20' in result_df.columns:
+            # 确保所有相关列都是Series
+            close_series = result_df['Close']
+            bb_upper_series = result_df['BB_upper_20']
+            bb_lower_series = result_df['BB_lower_20']
+
+            bb_range = bb_upper_series - bb_lower_series
+            # 避免除零错误
+            bb_range = bb_range.replace(0, np.nan)
+            result_df['BB_position'] = (close_series - bb_lower_series) / bb_range
+        else:
+            # 如果布林带计算失败，使用默认值
+            result_df['BB_position'] = 0.5
 
         # 缓存结果
         self.technical_cache['last_calculation'] = datetime.now()
@@ -187,8 +217,13 @@ class EfficientMarketDataProcessor:
         for window in self.volatility_windows:
             for indicator in base_indicators:
                 if indicator in df.columns:
+                    # 确保指标是Series
+                    indicator_series = df[indicator]
+                    if isinstance(indicator_series, pd.DataFrame):
+                        indicator_series = indicator_series.squeeze()
+
                     vol_col = f'{indicator}_vol_{window}'
-                    volatility_features[vol_col] = df[indicator].rolling(window=window, min_periods=window).std()
+                    volatility_features[vol_col] = indicator_series.rolling(window=window, min_periods=window).std()
 
         return volatility_features
 
@@ -201,10 +236,19 @@ class EfficientMarketDataProcessor:
         print("创建智能标签...")
         labels = np.ones(len(df))  # 默认平稳
 
+        # 确保Close是Series
+        close_series = df['Close']
+        if isinstance(close_series, pd.DataFrame):
+            close_series = close_series.squeeze()
+
         # 计算自适应阈值
         if volatility_adjust:
             # 使用近期波动率调整阈值
-            recent_volatility = df['returns'].rolling(window=20).std().fillna(0.02)
+            returns_series = df['returns']
+            if isinstance(returns_series, pd.DataFrame):
+                returns_series = returns_series.squeeze()
+
+            recent_volatility = returns_series.rolling(window=20).std().fillna(0.02)
             threshold_multiplier = 1.5  # 波动率倍数
             dynamic_threshold = recent_volatility * threshold_multiplier
         else:
@@ -215,12 +259,12 @@ class EfficientMarketDataProcessor:
 
         for period in lookback_periods:
             # 价格变化
-            price_change = (df['Close'] - df['Close'].shift(period)) / df['Close'].shift(period)
+            price_change = (close_series - close_series.shift(period)) / close_series.shift(period)
             trend_signals[f'trend_{period}'] = price_change
 
             # 移动平均趋势
-            sma_short = df['Close'].rolling(window=period // 2).mean()
-            sma_long = df['Close'].rolling(window=period).mean()
+            sma_short = close_series.rolling(window=period // 2).mean()
+            sma_long = close_series.rolling(window=period).mean()
             trend_signals[f'ma_trend_{period}'] = (sma_short - sma_long) / sma_long
 
         # 综合趋势得分
@@ -233,7 +277,7 @@ class EfficientMarketDataProcessor:
             local_min = series.rolling(window=window, center=True).min() == series
             return local_max, local_min
 
-        local_max, local_min = detect_local_extremes(df['Close'], window=15)
+        local_max, local_min = detect_local_extremes(close_series, window=15)
 
         # 智能标签分配
         for i in range(max(lookback_periods) + 1, len(df)):
@@ -249,6 +293,9 @@ class EfficientMarketDataProcessor:
             # 额外条件：布林带位置
             if 'BB_position' in df.columns:
                 bb_pos = df['BB_position'].iloc[i]
+                if isinstance(bb_pos, pd.Series):
+                    bb_pos = bb_pos.iloc[0] if len(bb_pos) > 0 else 0.5
+
                 if bb_pos > 0.8 and labels[i] == 2:  # 上轨附近，可能超买
                     labels[i] = 1  # 改为平稳
                 elif bb_pos < 0.2 and labels[i] == 0:  # 下轨附近，可能超卖

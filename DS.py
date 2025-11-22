@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-完整版：基于纳斯达克100指数技术指标波动率的市场反转点预测系统
+完整版：基于技术指标波动率的市场反转点预测系统
 包含Transformer和LSTM双模型支持
 """
 import os
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report
 from sklearn.model_selection import TimeSeriesSplit
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import warnings
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple
+
 
 warnings.filterwarnings('ignore')
 
@@ -86,9 +87,9 @@ class EfficientMarketDataProcessor:
                 except Exception as e:
                     print(f"缓存加载失败: {e}，重新下载数据...")
 
-        print("正在下载纳斯达克100指数数据...")
+        print("正在下载纳斯达克指数数据...")
         try:
-            data = yf.download("^NDX", period=period, interval='1h')
+            data = yf.download("^NDX", period=period, interval='1h', proxy="http://127.0.0.1:7890")
             data = data.dropna()
 
             if data.empty:

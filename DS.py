@@ -186,7 +186,7 @@ class EfficientMarketDataProcessor:
         # 价格位置相对布林带 - 修正版本
         if 'BB_upper_20' in result_df.columns and 'BB_lower_20' in result_df.columns:
             # 确保所有相关列都是Series
-            close_series = result_df['Close']
+            close_series = result_df['Close'].squeeze()
             bb_upper_series = result_df['BB_upper_20']
             bb_lower_series = result_df['BB_lower_20']
 
@@ -237,14 +237,14 @@ class EfficientMarketDataProcessor:
         labels = np.ones(len(df))  # 默认平稳
 
         # 确保Close是Series
-        close_series = df['Close']
+        close_series = df[('Close', '^NDX')]
         if isinstance(close_series, pd.DataFrame):
             close_series = close_series.squeeze()
 
         # 计算自适应阈值
         if volatility_adjust:
             # 使用近期波动率调整阈值
-            returns_series = df['returns']
+            returns_series = df[('returns', '')]
             if isinstance(returns_series, pd.DataFrame):
                 returns_series = returns_series.squeeze()
 
@@ -547,6 +547,9 @@ class SimpleLSTMPredictor(nn.Module):
         Returns:
             分类logits或 (logits, attention_weights)
         """
+        # 处理二维输入：添加序列长度维度
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (batch_size, 1, input_dim)
         batch_size, seq_len, _ = x.shape
 
         # LSTM前向传播
@@ -608,14 +611,17 @@ class SimpleLSTMPredictor(nn.Module):
             return None
 
 
-class SimpleTransformerPredictor(nn.Module):
+class ImprovedTransformerPredictor(nn.Module):
     """
-    Transformer预测器
+    改进的Transformer预测器，支持多种池化策略
     """
 
     def __init__(self, input_dim: int, num_heads: int = 4, num_layers: int = 2,
-                 dropout: float = 0.2, dim_feedforward: int = 64):
-        super(SimpleTransformerPredictor, self).__init__()
+                 dropout: float = 0.2, dim_feedforward: int = 64,
+                 pooling: str = 'last'):
+        super(ImprovedTransformerPredictor, self).__init__()
+
+        self.pooling = pooling  # 'last', 'mean', 'max'
 
         self.input_projection = nn.Linear(input_dim, 32)
 
@@ -652,19 +658,33 @@ class SimpleTransformerPredictor(nn.Module):
         前向传播
 
         Args:
-            x: 输入张量 (batch_size, seq_len, input_dim)
+            x: 输入张量 (batch_size, seq_len, input_dim) 或 (batch_size, input_dim)
 
         Returns:
             分类logits
         """
+        # 处理输入维度
+        if x.dim() == 2:
+            # 二维输入: (batch_size, input_dim) -> (batch_size, 1, input_dim)
+            x = x.unsqueeze(1)
+        elif x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D input")
+
         # 输入投影
         x = self.input_projection(x)  # (batch_size, seq_len, 32)
 
         # Transformer编码
         x = self.transformer(x)  # (batch_size, seq_len, 32)
 
-        # 使用最后一个时间步
-        x = x[:, -1, :]  # (batch_size, 32)
+        # 池化策略
+        if self.pooling == 'last':
+            x = x[:, -1, :]  # 最后一个时间步
+        elif self.pooling == 'mean':
+            x = x.mean(dim=1)  # 平均池化
+        elif self.pooling == 'max':
+            x = x.max(dim=1)[0]  # 最大池化
+        else:
+            raise ValueError(f"Unknown pooling strategy: {self.pooling}")
 
         # 分类
         output = self.classifier(x)  # (batch_size, 3)
@@ -695,11 +715,11 @@ class MultiModelPredictor:
         if model_type == 'lstm':
             self.model = SimpleLSTMPredictor(input_dim, **model_kwargs)
         elif model_type == 'transformer':
-            self.model = SimpleTransformerPredictor(input_dim, **model_kwargs)
+            self.model = ImprovedTransformerPredictor(input_dim, **model_kwargs)
         elif model_type == 'ensemble':
             self.models = {
                 'lstm': SimpleLSTMPredictor(input_dim, **model_kwargs.get('lstm', {})),
-                'transformer': SimpleTransformerPredictor(input_dim, **model_kwargs.get('transformer', {}))
+                'transformer': ImprovedTransformerPredictor(input_dim, **model_kwargs.get('transformer', {}))
             }
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
@@ -976,6 +996,7 @@ class AdvancedTrendPredictor:
 
     def run_advanced_pipeline(self, compare_models: bool = False):
         """运行高级预测流程"""
+        """运行高级预测流程"""
         print("开始高级趋势预测流程...")
 
         # 1. 获取和处理数据
@@ -997,7 +1018,9 @@ class AdvancedTrendPredictor:
         features_df = features_df.loc[common_idx]
         labels = labels[all_features.index.isin(common_idx)]
 
-        print(f"特征形状: {features_df.shape}, 标签分布: {np.unique(labels, return_counts=True)}")
+        print(f"特征形状: {features_df.shape}")
+        print(f"标签分布: {np.unique(labels, return_counts=True)}")
+        print(f"标签类型: {type(labels)}, 标签形状: {labels.shape if hasattr(labels, 'shape') else 'No shape'}")
 
         # 3. 模型比较（可选）
         if compare_models:
@@ -1031,37 +1054,87 @@ class AdvancedTrendPredictor:
         return features_df, labels, all_features
 
     def train_with_incremental_learning(self, features: np.ndarray, labels: np.ndarray):
-        """使用增量学习训练模型"""
+        """使用增量学习训练模型 - 修复版本"""
         print(f"使用{self.model_type.upper()}模型进行增量学习训练...")
 
         tscv = TimeSeriesSplit(n_splits=5)
+        fold_accuracies = []
         all_predictions = []
         all_true_labels = []
 
         for fold, (train_idx, test_idx) in enumerate(tscv.split(features)):
-            print(f"训练折叠 {fold + 1}/5")
+            print(f"\n--- 训练折叠 {fold + 1}/5 ---")
+            print(f"训练集大小: {len(train_idx)}, 测试集大小: {len(test_idx)}")
 
             X_train, X_test = features[train_idx], features[test_idx]
             y_train, y_test = labels[train_idx], labels[test_idx]
 
-            # 初始训练
-            if fold == 0:
-                self.model.initial_fit(X_train, y_train, epochs=30)
+            try:
+                # 初始训练
+                if fold == 0:
+                    self.model.initial_fit(X_train, y_train, epochs=30)
+                else:
+                    # 后续折叠使用增量学习
+                    self.model.partial_fit(X_train, y_train)
+
+                # 在测试集上预测
+                predictions, confidence_scores = self.model.predict(X_test)
+
+                # 调试信息
+                print(f"预测结果类型: {type(predictions)}")
+                print(f"预测结果形状: {getattr(predictions, 'shape', 'No shape')}")
+
+                # 处理不同的预测结果格式
+                if isinstance(predictions, (list, np.ndarray)):
+                    predictions_flat = np.array(predictions).flatten()
+                    y_test_flat = np.array(y_test).flatten()
+                else:
+                    # 如果是单个预测值
+                    predictions_flat = np.array([predictions])
+                    y_test_flat = np.array([y_test])
+
+                # 添加到累积列表
+                all_predictions.extend(predictions_flat.tolist())
+                all_true_labels.extend(y_test_flat.tolist())
+
+                # 计算当前折叠的准确率
+                fold_accuracy = np.mean(predictions_flat == y_test_flat)
+                fold_accuracies.append(fold_accuracy)
+                print(f"折叠 {fold + 1} 准确率: {fold_accuracy:.4f}")
+
+            except Exception as e:
+                print(f"折叠 {fold + 1} 训练出错: {e}")
+                continue
+
+        # 计算整体性能
+        if all_predictions and all_true_labels:
+            all_predictions = np.array(all_predictions)
+            all_true_labels = np.array(all_true_labels)
+
+            print(f"\n=== 最终评估 ===")
+            print(f"总预测样本数: {len(all_predictions)}")
+            print(f"总真实样本数: {len(all_true_labels)}")
+
+            # 确保形状匹配
+            min_length = min(len(all_predictions), len(all_true_labels))
+            if min_length > 0:
+                all_predictions = all_predictions[:min_length]
+                all_true_labels = all_true_labels[:min_length]
+
+                accuracy = np.mean(all_predictions == all_true_labels)
+                print(f"{self.model_type.upper()}模型最终准确率: {accuracy:.4f}")
+
+                if len(fold_accuracies) > 0:
+                    print(f"各折叠准确率: {[f'{acc:.4f}' for acc in fold_accuracies]}")
+                    print(f"平均折叠准确率: {np.mean(fold_accuracies):.4f}")
+
+                print("\n分类报告:")
+                print(classification_report(all_true_labels, all_predictions,
+                                            target_names=['下跌', '平稳', '上涨']))
             else:
-                # 后续折叠使用增量学习
-                self.model.partial_fit(X_train, y_train)
-
-            # 在测试集上预测
-            predictions, _ = self.model.predict(X_test)
-            all_predictions.extend(predictions)
-            all_true_labels.extend(y_test)
-
-        # 评估性能
-        accuracy = np.mean(np.array(all_predictions) == np.array(all_true_labels))
-        print(f"{self.model_type.upper()}模型最终准确率: {accuracy:.4f}")
-        print("\n分类报告:")
-        print(classification_report(all_true_labels, all_predictions,
-                                    target_names=['下跌', '平稳', '上涨']))
+                print("错误: 没有有效的预测结果")
+        else:
+            print("错误: 没有收集到任何预测结果")
 
         self.is_trained = True
 

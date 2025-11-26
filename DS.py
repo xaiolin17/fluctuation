@@ -825,15 +825,21 @@ class MultiModelPredictor:
         return train_losses, val_losses
 
     def predict(self, X: np.ndarray, return_probabilities: bool = False):
-        """预测"""
+        """预测 - 修复版本"""
         if not self.is_fitted:
             raise ValueError("模型尚未训练")
 
         X_scaled = self.scaler.transform(X)
 
-        if len(X_scaled.shape) == 2:
-            X_tensor = torch.FloatTensor(X_scaled).unsqueeze(0)
+        # 修复：正确处理输入维度
+        if len(X_scaled.shape) == 1:
+            # 单个样本
+            X_tensor = torch.FloatTensor(X_scaled).unsqueeze(0).unsqueeze(0)  # (1, 1, input_dim)
+        elif len(X_scaled.shape) == 2:
+            # 多个样本，每个样本是特征向量
+            X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1)  # (n_samples, 1, input_dim)
         else:
+            # 已经是3D
             X_tensor = torch.FloatTensor(X_scaled)
 
         if self.model_type == 'ensemble':
@@ -851,6 +857,10 @@ class MultiModelPredictor:
                 outputs = torch.stack(outputs).mean(dim=0)
             else:
                 outputs = self.model(X_tensor)
+
+            # 修复：确保输出维度正确
+            if outputs.dim() == 1:
+                outputs = outputs.unsqueeze(0)
 
             probabilities = torch.softmax(outputs, dim=1).numpy()
             predictions = np.argmax(probabilities, axis=1)
@@ -951,8 +961,16 @@ class EnhancedIncrementalLearningModel:
         self.update_count = 0
 
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """预测"""
-        return self.predictor.predict(X, return_probabilities=True)
+        """预测 - 修复版本"""
+        predictions, probabilities = self.predictor.predict(X, return_probabilities=True)
+
+        # 确保返回正确的形状
+        if len(predictions.shape) == 0:
+            predictions = np.array([predictions])
+        if len(probabilities.shape) == 1:
+            probabilities = probabilities.reshape(1, -1)
+
+        return predictions, probabilities
 
 
 class AdvancedTrendPredictor:
@@ -1083,6 +1101,8 @@ class AdvancedTrendPredictor:
                 # 调试信息
                 print(f"预测结果类型: {type(predictions)}")
                 print(f"预测结果形状: {getattr(predictions, 'shape', 'No shape')}")
+                print(f"预测的唯一值: {np.unique(predictions)}")
+                print(f"真实标签的唯一值: {np.unique(y_test)}")
 
                 # 处理不同的预测结果格式
                 if isinstance(predictions, (list, np.ndarray)):
@@ -1128,9 +1148,26 @@ class AdvancedTrendPredictor:
                     print(f"各折叠准确率: {[f'{acc:.4f}' for acc in fold_accuracies]}")
                     print(f"平均折叠准确率: {np.mean(fold_accuracies):.4f}")
 
+                # 修复：动态确定类别标签
+                unique_labels = np.unique(np.concatenate([all_true_labels, all_predictions]))
+                print(f"实际出现的类别: {unique_labels}")
+
+                # 创建对应的标签名称
+                label_names = []
+                for label in sorted(unique_labels):
+                    if label == 0:
+                        label_names.append('下跌')
+                    elif label == 1:
+                        label_names.append('平稳')
+                    elif label == 2:
+                        label_names.append('上涨')
+                    else:
+                        label_names.append(f'类别{label}')
+
                 print("\n分类报告:")
                 print(classification_report(all_true_labels, all_predictions,
-                                            target_names=['下跌', '平稳', '上涨']))
+                                            labels=sorted(unique_labels),
+                                            target_names=label_names))
             else:
                 print("错误: 没有有效的预测结果")
         else:

@@ -402,7 +402,7 @@ class RealisticBacktester:
             kelly_fraction = 0.05
 
         # 波动率调整
-        vol_adjustment = max(0.5, 1 - volatility * 10)
+        vol_adjustment = max(0.1, 1 - volatility * 10)
         position_size = current_capital * kelly_fraction * vol_adjustment
 
         return position_size
@@ -448,19 +448,9 @@ class RealisticBacktester:
                      prices: List[float], volatilities: List[float],
                      timestamps: List[datetime]) -> Dict[str, float]:
         """
-        运行现实回测 - 基于回撤的止损策略
-
-        参数:
-            predictions: 交易信号预测列表 (0=卖出, 1=持有, 2=买入)
-            confidence_scores: 模型预测的置信度分数列表
-            prices: 资产价格时间序列列表
-            volatilities: 市场波动率时间序列列表
-            timestamps: 对应的时间戳列表
-
-        返回:
-            Dict[str, float]: 包含回测结果的字典
+        运行现实回测 - 修复peak_capital更新问题
         """
-        print("运行基于回撤止损的回测...")
+        print("运行基于回撤止损 + 6%止盈的回测...")
         print(f"预测列表长度: {len(predictions)}")
         print(f"价格列表长度: {len(prices)}")
 
@@ -471,8 +461,9 @@ class RealisticBacktester:
         peak_capital = self.initial_capital  # 资金峰值
         trades = 0  # 交易次数统计
 
-        # 回撤止损相关变量
-        drawdown_threshold = 0.02  # 2%回撤止损阈值
+        # 风险控制参数
+        drawdown_threshold = 0.015  # 回撤止损阈值
+        take_profit_threshold = 0.06  # 6%止盈阈值
         entry_price = 0  # 入场价格
         position_direction = 0  # 持仓方向: 0=无持仓, 1=多头
 
@@ -480,11 +471,11 @@ class RealisticBacktester:
         self.equity_curve = [capital]
         self.trade_points = []  # 重置交易点记录
         self.drawdown_stop_trades = []  # 回撤止损交易记录
+        self.take_profit_trades = []  # 止盈交易记录
 
         # 主回测循环：遍历每个预测时点
         for i in range(1, len(predictions)):
             # ==================== 数据预处理和验证 ====================
-            # 修复价格数据类型问题
             current_price = prices[i]
             if hasattr(current_price, '__len__') and not isinstance(current_price, str):
                 if len(current_price) > 0:
@@ -494,7 +485,7 @@ class RealisticBacktester:
             else:
                 current_price = float(current_price)
 
-            current_timestamp = timestamps[i]  # 当前时间戳
+            current_timestamp = timestamps[i]
 
             # 获取置信度
             if i < len(confidence_scores):
@@ -505,36 +496,44 @@ class RealisticBacktester:
             else:
                 confidence = 0.5
 
-            # ==================== 风险指标计算 ====================
-            # 计算当前总资产价值：现金 + 持仓市值
+            # ==================== 关键修复：计算当前总资产价值 ====================
+            # 无论是否有持仓，都计算当前总资产
             current_value = capital + (position * current_price if position > 0 else 0)
 
-            # 更新最大回撤：记录从峰值到当前的最大跌幅
+            # 关键修复：peak_capital应该在每次资产创新高时更新，无论是否持仓
             if current_value > peak_capital:
-                peak_capital = current_value  # 更新资金峰值
+                peak_capital = current_value
 
-            drawdown = (peak_capital - current_value) / peak_capital  # 计算当前回撤
-            max_drawdown = max(max_drawdown, drawdown)  # 更新最大回撤
+            # ==================== 风险指标计算 ====================
+            # 计算当前回撤（基于当前peak_capital）
+            drawdown = (peak_capital - current_value) / peak_capital if peak_capital > 0 else 0
+            max_drawdown = max(max_drawdown, drawdown)
+
+            # ==================== 止盈检查 ====================
+            take_profit_triggered = False
+            if position > 0 and entry_price > 0:
+                current_return = (current_price - entry_price) / entry_price
+                if current_return >= take_profit_threshold:
+                    take_profit_triggered = True
+                    print(f"止盈触发: 当前收益率 {current_return:.2%} >= 止盈阈值 {take_profit_threshold:.2%}")
 
             # ==================== 回撤止损检查 ====================
             drawdown_stop_triggered = False
-
             if position > 0 and drawdown >= drawdown_threshold:
-                # 检查回撤止损条件
                 drawdown_stop_triggered = True
                 print(f"回撤止损触发: 当前回撤 {drawdown:.2%} > 阈值 {drawdown_threshold:.2%}")
 
             # ==================== 交易信号处理 ====================
-            signal = predictions[i]  # 当前信号
-            prev_signal = predictions[i - 1] if i > 0 else 1  # 前一时刻信号
+            signal = predictions[i]
+            prev_signal = predictions[i - 1] if i > 0 else 1
 
-            # 执行交易的标志：信号变化或回撤止损触发
-            should_trade = (signal != prev_signal) or drawdown_stop_triggered
+            # 执行交易的标志
+            should_trade = (signal != prev_signal) or take_profit_triggered or drawdown_stop_triggered
 
             if should_trade and position > 0:
-                # 平仓逻辑：如果当前有持仓且需要交易，先平仓
+                # 平仓逻辑
                 close_trade = self.execute_trade(0, current_price, capital,
-                                                 confidence, 0.02, current_timestamp)  # 使用固定波动率
+                                                 confidence, 0.02, current_timestamp)
 
                 # 计算盈亏
                 profit_loss = (current_price - entry_price) * position - close_trade['cost']
@@ -543,9 +542,24 @@ class RealisticBacktester:
                 # 更新资金
                 capital += position * current_price - close_trade['cost']
 
+                # 关键修复：平仓后立即更新当前价值和peak_capital
+                current_value = capital  # 平仓后总资产就是现金
+                if current_value > peak_capital:
+                    peak_capital = current_value
+
                 # 记录交易类型
                 trade_type = 'normal'
-                if drawdown_stop_triggered:
+                if take_profit_triggered:
+                    trade_type = 'take_profit'
+                    self.take_profit_trades.append({
+                        'timestamp': current_timestamp,
+                        'price': current_price,
+                        'entry_price': entry_price,
+                        'profit_loss': profit_loss,
+                        'profit_loss_pct': profit_loss_pct,
+                        'return_at_exit': (current_price - entry_price) / entry_price
+                    })
+                elif drawdown_stop_triggered:
                     trade_type = 'drawdown_stop'
                     self.drawdown_stop_trades.append({
                         'timestamp': current_timestamp,
@@ -564,32 +578,34 @@ class RealisticBacktester:
                     'equity': current_value,
                     'trade_type': trade_type,
                     'profit_loss': profit_loss,
-                    'drawdown': drawdown
+                    'drawdown': drawdown,
+                    'return_pct': profit_loss_pct
                 })
 
-                position = 0  # 重置持仓
-                trades += 1  # 交易计数
+                position = 0
+                trades += 1
                 position_direction = 0
 
-            # 开仓逻辑：如果新信号是买入且资金充足，且没有持仓，建立多头仓位
-            if signal == 2 and position == 0 and capital > 0:  # 买入信号且无持仓
-                # 执行买入交易
+            # 开仓逻辑
+            if signal == 2 and position == 0 and capital > 0:
                 buy_trade = self.execute_trade(2, current_price, capital,
-                                               confidence, 0.02, current_timestamp)  # 使用固定波动率
+                                               confidence, 0.02, current_timestamp)
                 if buy_trade['shares'] > 0:
-                    position = buy_trade['shares']  # 更新持仓股数
-                    entry_price = current_price  # 记录入场价格
-                    position_direction = 1  # 设置持仓方向为多头
+                    position = buy_trade['shares']
+                    entry_price = current_price
+                    position_direction = 1
 
-                    # 更新资金：扣除买入金额和交易成本
+                    # 更新资金
                     capital -= buy_trade['position_size'] + buy_trade['cost']
-                    trades += 1  # 交易计数
+                    trades += 1
 
-                    # 重置峰值资金为当前总价值（开仓后）
+                    # 关键修复：开仓后重新计算当前价值和peak_capital
                     current_total_value = capital + (position * current_price)
-                    peak_capital = current_total_value
+                    if current_total_value > peak_capital:
+                        peak_capital = current_total_value
 
-                    print(f"开仓: 价格 {current_price:.2f}, 回撤止损阈值: {drawdown_threshold:.2%}")
+                    print(
+                        f"开仓: 价格 {current_price:.2f}, 止盈阈值: {take_profit_threshold:.2%}, 回撤止损阈值: {drawdown_threshold:.2%}")
 
                     # 记录买入点
                     self.trade_points.append({
@@ -597,6 +613,7 @@ class RealisticBacktester:
                         'price': current_price,
                         'type': 'buy',
                         'equity': current_total_value,
+                        'take_profit_threshold': take_profit_threshold,
                         'drawdown_threshold': drawdown_threshold
                     })
 
@@ -604,48 +621,56 @@ class RealisticBacktester:
             self.equity_curve.append(current_value)
 
         # ==================== 回测结束处理 ====================
-        # 最终平仓：如果回测结束时仍有持仓，按最后价格平仓
+        # 最终平仓
         if position > 0:
             final_price = float(prices[-1])
             close_trade = self.execute_trade(0, final_price, capital, 0.5, 0.02, timestamps[-1])
             capital += position * final_price - close_trade['cost']
 
-            # 计算最终盈亏
             profit_loss = (final_price - entry_price) * position - close_trade['cost']
+            profit_loss_pct = (profit_loss / (entry_price * position)) * 100 if entry_price > 0 else 0
 
-            # 记录最终卖出点
+            # 关键修复：最终平仓后更新peak_capital
+            current_value = capital
+            if current_value > peak_capital:
+                peak_capital = current_value
+
             self.trade_points.append({
                 'timestamp': timestamps[-1],
                 'price': final_price,
                 'type': 'sell',
                 'equity': capital,
                 'trade_type': 'close_out',
-                'profit_loss': profit_loss
+                'profit_loss': profit_loss,
+                'return_pct': profit_loss_pct
             })
 
         # ==================== 绩效指标计算 ====================
-        # 总收益率计算
-        total_return = (capital - self.initial_capital) / self.initial_capital
+        # 重新计算最终的最大回撤，确保准确性
+        final_max_drawdown = 0
+        final_peak = self.equity_curve[0]
 
-        # 年化收益率：假设252个交易日
+        for value in self.equity_curve:
+            if value > final_peak:
+                final_peak = value
+            current_drawdown = (final_peak - value) / final_peak if final_peak > 0 else 0
+            final_max_drawdown = max(final_max_drawdown, current_drawdown)
+
+        # 其他绩效指标计算保持不变...
+        total_return = (capital - self.initial_capital) / self.initial_capital
         annual_return = total_return / (len(predictions) / 252) if len(predictions) > 0 else 0
 
-        # 夏普比率计算
         returns = []
         if len(self.equity_curve) > 1:
             returns = [(self.equity_curve[i] - self.equity_curve[i - 1]) / self.equity_curve[i - 1]
                        for i in range(1, len(self.equity_curve))]
 
-        if len(returns) > 0:
-            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
-        else:
-            sharpe_ratio = 0
+        sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if returns and np.std(returns) > 0 else 0
 
         # 胜率计算
         winning_trades = 0
         total_trade_pairs = 0
 
-        # 计算买卖配对交易的胜率
         for i in range(0, len(self.trade_points) - 1, 2):
             if i + 1 < len(self.trade_points):
                 buy_point = self.trade_points[i]
@@ -657,7 +682,10 @@ class RealisticBacktester:
 
         win_rate = winning_trades / total_trade_pairs if total_trade_pairs > 0 else 0
 
-        # 回撤止损统计
+        # 止盈和止损统计
+        take_profit_count = len(self.take_profit_trades)
+        take_profit_rate = take_profit_count / total_trade_pairs if total_trade_pairs > 0 else 0
+
         drawdown_stop_count = len(self.drawdown_stop_trades)
         drawdown_stop_rate = drawdown_stop_count / total_trade_pairs if total_trade_pairs > 0 else 0
 
@@ -667,10 +695,13 @@ class RealisticBacktester:
             'final_capital': capital,
             'total_return': total_return,
             'annual_return': annual_return,
-            'max_drawdown': max_drawdown,
+            'max_drawdown': final_max_drawdown,  # 使用重新计算的最大回撤
             'sharpe_ratio': sharpe_ratio,
             'total_trades': trades,
             'win_rate': win_rate,
+            'take_profit_count': take_profit_count,
+            'take_profit_rate': take_profit_rate,
+            'take_profit_threshold': take_profit_threshold,
             'drawdown_stop_count': drawdown_stop_count,
             'drawdown_stop_rate': drawdown_stop_rate,
             'drawdown_threshold': drawdown_threshold,
@@ -682,10 +713,10 @@ class RealisticBacktester:
         return results
 
     def print_backtest_results(self, results: Dict[str, float]):
-        """打印基于回撤止损的回测结果"""
-        print("\n" + "=" * 60)
-        print("基于回撤止损的回测结果")
-        print("=" * 60)
+        """打印基于回撤止损+止盈的回测结果"""
+        print("\n" + "=" * 70)
+        print("基于回撤止损 + 6%止盈的回测结果")
+        print("=" * 70)
         print(f"初始资金: ${results['initial_capital']:,.2f}")
         print(f"最终资金: ${results['final_capital']:,.2f}")
         print(f"总收益率: {results['total_return']:.2%}")
@@ -694,10 +725,20 @@ class RealisticBacktester:
         print(f"夏普比率: {results['sharpe_ratio']:.2f}")
         print(f"总交易次数: {results['total_trades']}")
         print(f"胜率: {results['win_rate']:.2%}")
+        print(f"止盈次数: {results['take_profit_count']}")
+        print(f"止盈率: {results['take_profit_rate']:.2%}")
+        print(f"止盈阈值: {results['take_profit_threshold']:.2%}")
         print(f"回撤止损次数: {results['drawdown_stop_count']}")
         print(f"回撤止损率: {results['drawdown_stop_rate']:.2%}")
         print(f"回撤止损阈值: {results['drawdown_threshold']:.2%}")
-        print("=" * 60)
+        print("=" * 70)
+
+        # 打印止盈交易的详细信息
+        if self.take_profit_trades:
+            avg_take_profit = np.mean([t['profit_loss_pct'] for t in self.take_profit_trades])
+            avg_return_at_take_profit = np.mean([t['return_at_exit'] for t in self.take_profit_trades])
+            print(f"止盈交易平均收益率: {avg_take_profit:.2f}%")
+            print(f"触发止盈时的平均收益率: {avg_return_at_take_profit:.2%}")
 
         # 打印回撤止损交易的详细信息
         if self.drawdown_stop_trades:
@@ -709,7 +750,7 @@ class RealisticBacktester:
     def plot_backtest_results(self, prices: List[float], timestamps: List[datetime],
                               predictions: List[int] = None, save_path: str = None):
         """
-        绘制回测结果图表
+        绘制回测结果图表 - 增强版，显示止盈点
 
         参数:
             prices: 价格序列
@@ -736,12 +777,15 @@ class RealisticBacktester:
         # 第一个子图：价格走势和买卖点
         ax1.plot(timestamps, prices, label='价格', color='blue', linewidth=1, alpha=0.7)
         ax1.set_ylabel('价格', fontsize=12)
-        ax1.set_title('价格走势与交易信号', fontsize=14, fontweight='bold')
+        ax1.set_title('价格走势与交易信号 (绿色=买入, 红色=卖出, 金色=止盈)', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
 
-        # 绘制买卖点
+        # 绘制买卖点 - 区分止盈点
         buy_points = [point for point in self.trade_points if point['type'] == 'buy']
-        sell_points = [point for point in self.trade_points if point['type'] == 'sell']
+        sell_points_normal = [point for point in self.trade_points if
+                              point['type'] == 'sell' and point.get('trade_type') != 'take_profit']
+        sell_points_take_profit = [point for point in self.trade_points if
+                                   point['type'] == 'sell' and point.get('trade_type') == 'take_profit']
 
         if buy_points:
             buy_times = [point['timestamp'] for point in buy_points]
@@ -749,11 +793,17 @@ class RealisticBacktester:
             ax1.scatter(buy_times, buy_prices, color='green', marker='^',
                         s=100, label='买入', zorder=5)
 
-        if sell_points:
-            sell_times = [point['timestamp'] for point in sell_points]
-            sell_prices = [point['price'] for point in sell_points]
+        if sell_points_normal:
+            sell_times = [point['timestamp'] for point in sell_points_normal]
+            sell_prices = [point['price'] for point in sell_points_normal]
             ax1.scatter(sell_times, sell_prices, color='red', marker='v',
-                        s=100, label='卖出', zorder=5)
+                        s=100, label='普通卖出', zorder=5)
+
+        if sell_points_take_profit:
+            take_profit_times = [point['timestamp'] for point in sell_points_take_profit]
+            take_profit_prices = [point['price'] for point in sell_points_take_profit]
+            ax1.scatter(take_profit_times, take_profit_prices, color='gold', marker='v',
+                        s=120, label='止盈卖出', zorder=6, edgecolors='orange', linewidth=2)
 
         # 如果有预测信号，在背景中显示
         if predictions is not None and len(predictions) == len(prices):
@@ -788,14 +838,16 @@ class RealisticBacktester:
         ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
 
-        # 添加统计信息文本框
+        # 添加统计信息文本框 - 包含止盈信息
         stats_text = f"""
-回测统计信息:
-初始资金: ${self.initial_capital:,.0f}
-最终资金: ${equity_curve[-1]:,.0f}
-总收益率: {(equity_curve[-1] / self.initial_capital - 1):.2%}
-总交易次数: {len(self.trade_points)}
-最大回撤: {max(0, (max(equity_curve) - min(equity_curve)) / max(equity_curve)):.2%}
+    回测统计信息:
+    初始资金: ${self.initial_capital:,.0f}
+    最终资金: ${equity_curve[-1]:,.0f}
+    总收益率: {(equity_curve[-1] / self.initial_capital - 1):.2%}
+    总交易次数: {len(self.trade_points)}
+    止盈次数: {len(self.take_profit_trades)}
+    止盈率: {len(self.take_profit_trades) / len([p for p in self.trade_points if p['type'] == 'sell']):.2%}
+    最大回撤: {max(0, (max(equity_curve) - min(equity_curve)) / max(equity_curve)):.2%}
         """
 
         # 在权益曲线图上添加统计信息
@@ -816,34 +868,45 @@ class RealisticBacktester:
     def plot_detailed_analysis(self, prices: List[float], timestamps: List[datetime],
                                predictions: List[int], save_path: str = None):
         """
-        绘制详细分析图表（包含更多技术指标）
+        绘制详细分析图表（包含更多技术指标和止盈分析）
         """
         print("生成详细分析图表...")
 
         # 创建更详细的图表
-        fig = plt.figure(figsize=(16, 14))
-        gs = fig.add_gridspec(4, 1, height_ratios=[3, 2, 2, 2])
+        fig = plt.figure(figsize=(16, 16))
+        gs = fig.add_gridspec(5, 1, height_ratios=[3, 2, 2, 2, 2])
 
         ax1 = fig.add_subplot(gs[0])  # 价格和交易信号
         ax2 = fig.add_subplot(gs[1])  # 权益曲线
         ax3 = fig.add_subplot(gs[2])  # 收益率分布
         ax4 = fig.add_subplot(gs[3])  # 交易统计
+        ax5 = fig.add_subplot(gs[4])  # 止盈分析
 
         # 子图1：价格和交易信号
         ax1.plot(timestamps, prices, label='价格', color='navy', linewidth=1.5)
 
-        # 标记买卖点
+        # 标记买卖点 - 区分止盈点
         buy_dates = [point['timestamp'] for point in self.trade_points if point['type'] == 'buy']
         buy_prices = [point['price'] for point in self.trade_points if point['type'] == 'buy']
-        sell_dates = [point['timestamp'] for point in self.trade_points if point['type'] == 'sell']
-        sell_prices = [point['price'] for point in self.trade_points if point['type'] == 'sell']
+
+        sell_dates_normal = [point['timestamp'] for point in self.trade_points if
+                             point['type'] == 'sell' and point.get('trade_type') != 'take_profit']
+        sell_prices_normal = [point['price'] for point in self.trade_points if
+                              point['type'] == 'sell' and point.get('trade_type') != 'take_profit']
+
+        sell_dates_take_profit = [point['timestamp'] for point in self.trade_points if
+                                  point['type'] == 'sell' and point.get('trade_type') == 'take_profit']
+        sell_prices_take_profit = [point['price'] for point in self.trade_points if
+                                   point['type'] == 'sell' and point.get('trade_type') == 'take_profit']
 
         ax1.scatter(buy_dates, buy_prices, color='lime', marker='^', s=120,
                     label=f'买入 ({len(buy_dates)})', zorder=5, edgecolors='darkgreen', linewidth=2)
-        ax1.scatter(sell_dates, sell_prices, color='red', marker='v', s=120,
-                    label=f'卖出 ({len(sell_dates)})', zorder=5, edgecolors='darkred', linewidth=2)
+        ax1.scatter(sell_dates_normal, sell_prices_normal, color='red', marker='v', s=120,
+                    label=f'普通卖出 ({len(sell_dates_normal)})', zorder=5, edgecolors='darkred', linewidth=2)
+        ax1.scatter(sell_dates_take_profit, sell_prices_take_profit, color='gold', marker='v', s=150,
+                    label=f'止盈卖出 ({len(sell_dates_take_profit)})', zorder=6, edgecolors='orange', linewidth=2)
 
-        ax1.set_title('价格走势与交易点位', fontsize=14, fontweight='bold')
+        ax1.set_title('价格走势与交易点位 (包含6%止盈策略)', fontsize=14, fontweight='bold')
         ax1.set_ylabel('价格', fontsize=12)
         ax1.legend()
         ax1.grid(True, alpha=0.3)
@@ -881,6 +944,7 @@ class RealisticBacktester:
         # 子图4：交易统计
         if self.trade_log:
             trade_profits = []
+            trade_types = []  # 记录交易类型
             for i in range(0, len(self.trade_points) - 1, 2):
                 if i + 1 < len(self.trade_points):
                     buy_point = self.trade_points[i]
@@ -888,12 +952,22 @@ class RealisticBacktester:
                     if buy_point['type'] == 'buy' and sell_point['type'] == 'sell':
                         profit = (sell_point['price'] - buy_point['price']) / buy_point['price']
                         trade_profits.append(profit)
+                        trade_types.append(sell_point.get('trade_type', 'normal'))
 
             if trade_profits:
-                colors = ['green' if p > 0 else 'red' for p in trade_profits]
+                # 为不同类型的交易设置不同颜色
+                colors = []
+                for trade_type in trade_types:
+                    if trade_type == 'take_profit':
+                        colors.append('gold')
+                    elif trade_type == 'drawdown_stop':
+                        colors.append('red')
+                    else:
+                        colors.append('blue' if trade_profits[len(colors)] > 0 else 'lightcoral')
+
                 bars = ax4.bar(range(len(trade_profits)), trade_profits, color=colors, alpha=0.7)
                 ax4.axhline(y=0, color='black', linewidth=0.8)
-                ax4.set_title('单笔交易收益率', fontsize=14, fontweight='bold')
+                ax4.set_title('单笔交易收益率 (金色=止盈, 红色=止损)', fontsize=14, fontweight='bold')
                 ax4.set_xlabel('交易序号')
                 ax4.set_ylabel('收益率')
                 ax4.grid(True, alpha=0.3)
@@ -903,6 +977,25 @@ class RealisticBacktester:
                 ax4.axhline(y=avg_profit, color='blue', linestyle='--',
                             label=f'平均收益率: {avg_profit:.2%}')
                 ax4.legend()
+
+        # 子图5：止盈分析
+        if self.take_profit_trades:
+            take_profit_returns = [t['return_at_exit'] for t in self.take_profit_trades]
+            take_profit_dates = [t['timestamp'] for t in self.take_profit_trades]
+
+            ax5.bar(take_profit_dates, take_profit_returns, color='gold', alpha=0.7, label='止盈收益率')
+            ax5.axhline(y=0.06, color='red', linestyle='--', label='6%止盈目标')
+            ax5.set_title('止盈交易收益率分析', fontsize=14, fontweight='bold')
+            ax5.set_xlabel('时间')
+            ax5.set_ylabel('收益率')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+
+            # 添加止盈统计
+            avg_take_profit = np.mean(take_profit_returns)
+            ax5.text(0.02, 0.98, f'平均止盈收益率: {avg_take_profit:.2%}',
+                     transform=ax5.transAxes, fontsize=10,
+                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
         plt.tight_layout()
 

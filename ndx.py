@@ -282,7 +282,7 @@ class EfficientMarketDataProcessor:
 
         return volatility_features
 
-    def create_enhanced_labels(self, features_df: pd.DataFrame, price_data, lookforward_days=5):
+    def create_enhanced_labels(self, features_df: pd.DataFrame, price_data, lookforward_days=3):
         """
         增强版标签生成（替换原函数）
         """
@@ -329,33 +329,14 @@ class EfficientMarketDataProcessor:
                 future_returns.append(np.nan)
                 continue
 
-        # 添加NaN以对齐长度
-        future_returns.extend([np.nan] * lookforward_days)
-
-        # 修复：确保 future_returns 是纯数值数组
-        future_returns = np.array(future_returns, dtype=float)
-
-        # 使用动态阈值
-        valid_returns = future_returns[~np.isnan(future_returns)]
-
-        if len(valid_returns) > 0:
-            # 基于波动率的自适应阈值
-            volatility = np.std(valid_returns)
-            upper_threshold = volatility * 0.8  # 上涨阈值
-            lower_threshold = -volatility * 0.8  # 下跌阈值
-        else:
-            # 如果没有有效数据，使用默认阈值
-            upper_threshold = 0.015
-            lower_threshold = -0.015
-
         # 创建标签：0=下跌, 1=平稳, 2=上涨
         labels = []
         for ret in future_returns:
             if np.isnan(ret):
                 labels.append(1)  # 平稳作为默认值
-            elif ret > upper_threshold:
+            elif ret > 0.01:
                 labels.append(2)  # 上涨
-            elif ret < lower_threshold:
+            elif ret < -0.005:
                 labels.append(0)  # 下跌
             else:
                 labels.append(1)  # 平稳
@@ -462,8 +443,8 @@ class RealisticBacktester:
         trades = 0  # 交易次数统计
 
         # 风险控制参数
-        drawdown_threshold = 0.015  # 回撤止损阈值
-        take_profit_threshold = 0.06  # 6%止盈阈值
+        drawdown_threshold = 0.006  # 回撤止损阈值
+        take_profit_threshold = 0.044  # 止盈阈值
         entry_price = 0  # 入场价格
         position_direction = 0  # 持仓方向: 0=无持仓, 1=多头
 
@@ -544,8 +525,7 @@ class RealisticBacktester:
 
                 # 关键修复：平仓后立即更新当前价值和peak_capital
                 current_value = capital  # 平仓后总资产就是现金
-                if current_value > peak_capital:
-                    peak_capital = current_value
+                peak_capital = current_value
 
                 # 记录交易类型
                 trade_type = 'normal'
@@ -601,8 +581,7 @@ class RealisticBacktester:
 
                     # 关键修复：开仓后重新计算当前价值和peak_capital
                     current_total_value = capital + (position * current_price)
-                    if current_total_value > peak_capital:
-                        peak_capital = current_total_value
+                    peak_capital = current_total_value
 
                     print(
                         f"开仓: 价格 {current_price:.2f}, 止盈阈值: {take_profit_threshold:.2%}, 回撤止损阈值: {drawdown_threshold:.2%}")
@@ -632,8 +611,6 @@ class RealisticBacktester:
 
             # 关键修复：最终平仓后更新peak_capital
             current_value = capital
-            if current_value > peak_capital:
-                peak_capital = current_value
 
             self.trade_points.append({
                 'timestamp': timestamps[-1],
@@ -838,6 +815,8 @@ class RealisticBacktester:
         ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
 
+        sell_points = [p for p in self.trade_points if p['type'] == 'sell']
+        take_profit_rate = len(self.take_profit_trades) / len(sell_points) if sell_points else 0
         # 添加统计信息文本框 - 包含止盈信息
         stats_text = f"""
     回测统计信息:
@@ -846,7 +825,7 @@ class RealisticBacktester:
     总收益率: {(equity_curve[-1] / self.initial_capital - 1):.2%}
     总交易次数: {len(self.trade_points)}
     止盈次数: {len(self.take_profit_trades)}
-    止盈率: {len(self.take_profit_trades) / len([p for p in self.trade_points if p['type'] == 'sell']):.2%}
+    止盈率: {take_profit_rate:.2%}
     最大回撤: {max(0, (max(equity_curve) - min(equity_curve)) / max(equity_curve)):.2%}
         """
 
@@ -1203,7 +1182,7 @@ class MultiModelPredictor:
         model = model.to(device)
 
         # 带类别权重的损失函数
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 0.8, 1.2]).to(device))
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([2, 1, 1.5]).to(device))
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
@@ -1644,7 +1623,7 @@ class AdvancedTrendPredictor:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         lstm_model = lstm_model.to(device)
 
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 0.8, 1.2]).to(device))
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([2, 1, 1.5]).to(device))
         optimizer = torch.optim.AdamW(lstm_model.parameters(), lr=0.001, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
@@ -2056,3 +2035,40 @@ if __name__ == "__main__":
         print(f"系统运行出错: {e}")
         import traceback
         traceback.print_exc()  # 打印详细错误信息
+
+# if __name__ == "__main__":
+#     # 可以选择不同的模型类型
+#     model_types = ['lstm', 'transformer', 'ensemble']
+#     selected_model = 'lstm'  # 可以更改为 'transformer' 或 'ensemble'
+#
+#     # LSTM特定参数 - 使用增强参数
+#     lstm_kwargs = {
+#         'hidden_size': 128,
+#         'num_layers': 3,
+#         'dropout_rate': 0.3
+#     }
+#
+#     predictor = AdvancedTrendPredictor(
+#         model_type=selected_model,
+#         **lstm_kwargs
+#     )
+#
+#     # 1. 获取和处理数据
+#     data = AdvancedTrendPredictor().data_processor.fetch_data(period="2y")
+#     tech_data = AdvancedTrendPredictor().data_processor.enhanced_calculate_technical_indicators(data)
+#     vol_features = AdvancedTrendPredictor().data_processor.calculate_volatility_features_vectorized(tech_data)
+#
+#     # 2. 合并特征和创建标签
+#     all_features = pd.concat([tech_data, vol_features], axis=1)
+#
+#     # 修复：更新特征列选择以匹配新的技术指标名称
+#     feature_columns = [col for col in all_features.columns if any(x in col for x in
+#                                                                   ['SMA', 'EMA', 'RSI', 'BB', 'volatility',
+#                                                                    'momentum', '_vol_', 'returns', 'log_returns',
+#                                                                    'price_ratio', 'ROC', 'volume', 'OBV',
+#                                                                    'price_position'])]
+#     features_df = all_features[feature_columns].dropna()
+#
+#     # 使用增强版标签生成
+#     features_df, labels = AdvancedTrendPredictor().data_processor.create_enhanced_labels(features_df, data)
+#     results = predictor.run_realistic_backtest(features_df, labels, data)

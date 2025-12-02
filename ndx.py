@@ -282,7 +282,7 @@ class EfficientMarketDataProcessor:
 
         return volatility_features
 
-    def create_enhanced_labels(self, features_df: pd.DataFrame, price_data, lookforward_days=3):
+    def create_enhanced_labels(self, features_df: pd.DataFrame, price_data, lookforward_days=2):
         """
         增强版标签生成（替换原函数）
         """
@@ -329,14 +329,33 @@ class EfficientMarketDataProcessor:
                 future_returns.append(np.nan)
                 continue
 
+        # 添加NaN以对齐长度
+        future_returns.extend([np.nan] * lookforward_days)
+
+        # 修复：确保 future_returns 是纯数值数组
+        future_returns = np.array(future_returns, dtype=float)
+
+        # 使用动态阈值
+        valid_returns = future_returns[~np.isnan(future_returns)]
+
+        if len(valid_returns) > 0:
+            # 基于波动率的自适应阈值
+            volatility = np.std(valid_returns)
+            upper_threshold = volatility * 1.618  # 上涨阈值
+            lower_threshold = -volatility * 0.8  # 下跌阈值
+        else:
+            # 如果没有有效数据，使用默认阈值
+            upper_threshold = 0.005
+            lower_threshold = -0.005
+
         # 创建标签：0=下跌, 1=平稳, 2=上涨
         labels = []
         for ret in future_returns:
             if np.isnan(ret):
                 labels.append(1)  # 平稳作为默认值
-            elif ret > 0.01:
+            elif ret > upper_threshold:
                 labels.append(2)  # 上涨
-            elif ret < -0.005:
+            elif ret < lower_threshold:
                 labels.append(0)  # 下跌
             else:
                 labels.append(1)  # 平稳
@@ -429,9 +448,9 @@ class RealisticBacktester:
                      prices: List[float], volatilities: List[float],
                      timestamps: List[datetime]) -> Dict[str, float]:
         """
-        运行现实回测 - 修复peak_capital更新问题
+        运行分阶段止损止盈回测（趋势跟踪策略）
         """
-        print("运行基于回撤止损 + 6%止盈的回测...")
+        print("运行基于分阶段止损止盈（趋势跟踪）的回测...")
         print(f"预测列表长度: {len(predictions)}")
         print(f"价格列表长度: {len(prices)}")
 
@@ -442,11 +461,36 @@ class RealisticBacktester:
         peak_capital = self.initial_capital  # 资金峰值
         trades = 0  # 交易次数统计
 
-        # 风险控制参数
-        drawdown_threshold = 0.006  # 回撤止损阈值
-        take_profit_threshold = 0.044  # 止盈阈值
+        # ==================== 分阶段风险控制参数 ====================
+        # 阶段1: 初始止损止盈（刚入场时严格保护）
+        initial_stop_loss = 0.03  # 初始止损3%
+        initial_take_profit = 0.10  # 初始止盈10%
+
+        # 阶段2: 移动止损（有盈利后启动跟踪保护）
+        trailing_stop_activation = 0.05  # 盈利5%后启动移动止损
+        trailing_stop_distance = 0.03  # 移动止损距离3%（从最高点回落3%触发）
+
+        # 阶段3: 动态止盈（根据盈利幅度调整止盈点）
+        dynamic_take_profit_levels = {
+            0.05: 0.10,  # 盈利5%时，止盈设为10%
+            0.10: 0.15,  # 盈利10%时，止盈设为15%
+            0.15: 0.20,  # 盈利15%时，止盈设为20%
+            0.20: 0.25  # 盈利20%时，止盈设为25%
+        }
+
+        print(f"分阶段风险控制参数:")
+        print(f"- 初始止损: {initial_stop_loss:.2%}")
+        print(f"- 初始止盈: {initial_take_profit:.2%}")
+        print(f"- 移动止损激活: 盈利{trailing_stop_activation:.2%}后启动")
+        print(f"- 移动止损距离: {trailing_stop_distance:.2%}")
+
+        # 持仓相关变量
         entry_price = 0  # 入场价格
         position_direction = 0  # 持仓方向: 0=无持仓, 1=多头
+        trailing_stop_activated = False  # 是否已激活移动止损
+        trailing_stop_price = 0  # 移动止损价格
+        highest_price_since_entry = 0  # 入场后的最高价格
+        current_take_profit_threshold = initial_take_profit  # 当前止盈阈值（动态调整）
 
         # 权益曲线记录
         self.equity_curve = [capital]
@@ -490,25 +534,71 @@ class RealisticBacktester:
             drawdown = (peak_capital - current_value) / peak_capital if peak_capital > 0 else 0
             max_drawdown = max(max_drawdown, drawdown)
 
-            # ==================== 止盈检查 ====================
-            take_profit_triggered = False
+            # ==================== 持仓管理 ====================
             if position > 0 and entry_price > 0:
+                # 计算当前收益率
                 current_return = (current_price - entry_price) / entry_price
-                if current_return >= take_profit_threshold:
-                    take_profit_triggered = True
-                    print(f"止盈触发: 当前收益率 {current_return:.2%} >= 止盈阈值 {take_profit_threshold:.2%}")
 
-            # ==================== 回撤止损检查 ====================
-            drawdown_stop_triggered = False
-            if position > 0 and drawdown >= drawdown_threshold:
-                drawdown_stop_triggered = True
-                print(f"回撤止损触发: 当前回撤 {drawdown:.2%} > 阈值 {drawdown_threshold:.2%}")
+                # 更新入场后的最高价格
+                if current_price > highest_price_since_entry:
+                    highest_price_since_entry = current_price
+
+                    # 动态调整止盈阈值（根据最高盈利水平）
+                    for level, take_profit in sorted(dynamic_take_profit_levels.items()):
+                        if current_return >= level:
+                            current_take_profit_threshold = take_profit
+
+                # ==================== 移动止损管理 ====================
+                if not trailing_stop_activated:
+                    # 检查是否达到移动止损激活条件
+                    if current_return >= trailing_stop_activation:
+                        trailing_stop_activated = True
+                        trailing_stop_price = highest_price_since_entry * (1 - trailing_stop_distance)
+                        print(f"移动止损激活: 盈利{current_return:.2%} ≥ 激活阈值{trailing_stop_activation:.2%}")
+                        print(f"移动止损价格: {trailing_stop_price:.2f} (基于最高价{highest_price_since_entry:.2f})")
+                else:
+                    # 更新移动止损价格（只上不下）
+                    potential_new_stop = highest_price_since_entry * (1 - trailing_stop_distance)
+                    if potential_new_stop > trailing_stop_price:
+                        trailing_stop_price = potential_new_stop
+                        # print(f"移动止损上移: {trailing_stop_price:.2f}")
+
+                # ==================== 止盈检查 ====================
+                take_profit_triggered = False
+                if current_return >= current_take_profit_threshold:
+                    take_profit_triggered = True
+                    print(f"止盈触发: 当前收益率 {current_return:.2%} >= 止盈阈值 {current_take_profit_threshold:.2%}")
+
+                # ==================== 止损检查 ====================
+                stop_loss_triggered = False
+
+                if trailing_stop_activated:
+                    # 使用移动止损
+                    if current_price <= trailing_stop_price:
+                        stop_loss_triggered = True
+                        print(f"移动止损触发: 当前价格 {current_price:.2f} ≤ 移动止损价 {trailing_stop_price:.2f}")
+                        print(
+                            f"从最高点回撤: {(highest_price_since_entry - current_price) / highest_price_since_entry:.2%}")
+                else:
+                    # 使用固定止损
+                    if current_return <= -initial_stop_loss:
+                        stop_loss_triggered = True
+                        print(f"固定止损触发: 亏损{current_return:.2%} ≤ 止损阈值{-initial_stop_loss:.2%}")
+
+                # 重命名变量以保持与原有代码兼容
+                drawdown_stop_triggered = stop_loss_triggered
+
+            else:
+                # 无持仓状态，重置变量
+                take_profit_triggered = False
+                drawdown_stop_triggered = False
+                current_return = 0
 
             # ==================== 交易信号处理 ====================
             signal = predictions[i]
             prev_signal = predictions[i - 1] if i > 0 else 1
 
-            # 执行交易的标志
+            # 执行交易的标志（包括止盈止损触发）
             should_trade = (signal != prev_signal) or take_profit_triggered or drawdown_stop_triggered
 
             if should_trade and position > 0:
@@ -537,17 +627,24 @@ class RealisticBacktester:
                         'entry_price': entry_price,
                         'profit_loss': profit_loss,
                         'profit_loss_pct': profit_loss_pct,
-                        'return_at_exit': (current_price - entry_price) / entry_price
+                        'return_at_exit': current_return,
+                        'trailing_stop_activated': trailing_stop_activated,
+                        'trailing_stop_price': trailing_stop_price if trailing_stop_activated else None,
+                        'highest_price_since_entry': highest_price_since_entry
                     })
                 elif drawdown_stop_triggered:
                     trade_type = 'drawdown_stop'
+                    stop_type = 'trailing_stop' if trailing_stop_activated else 'fixed_stop'
                     self.drawdown_stop_trades.append({
                         'timestamp': current_timestamp,
                         'price': current_price,
                         'entry_price': entry_price,
                         'profit_loss': profit_loss,
                         'profit_loss_pct': profit_loss_pct,
-                        'drawdown_at_stop': drawdown
+                        'current_return': current_return,
+                        'stop_type': stop_type,
+                        'trailing_stop_price': trailing_stop_price if trailing_stop_activated else None,
+                        'highest_price_since_entry': highest_price_since_entry
                     })
 
                 # 记录卖出点
@@ -559,10 +656,19 @@ class RealisticBacktester:
                     'trade_type': trade_type,
                     'profit_loss': profit_loss,
                     'drawdown': drawdown,
-                    'return_pct': profit_loss_pct
+                    'return_pct': profit_loss_pct,
+                    'current_return_at_exit': current_return,
+                    'trailing_stop_activated': trailing_stop_activated,
+                    'trailing_stop_price': trailing_stop_price if trailing_stop_activated else None
                 })
 
+                # 平仓后重置持仓相关变量
                 position = 0
+                entry_price = 0
+                trailing_stop_activated = False
+                trailing_stop_price = 0
+                highest_price_since_entry = 0
+                current_take_profit_threshold = initial_take_profit
                 trades += 1
                 position_direction = 0
 
@@ -573,6 +679,7 @@ class RealisticBacktester:
                 if buy_trade['shares'] > 0:
                     position = buy_trade['shares']
                     entry_price = current_price
+                    highest_price_since_entry = current_price  # 初始化最高价格
                     position_direction = 1
 
                     # 更新资金
@@ -583,8 +690,10 @@ class RealisticBacktester:
                     current_total_value = capital + (position * current_price)
                     peak_capital = current_total_value
 
-                    print(
-                        f"开仓: 价格 {current_price:.2f}, 止盈阈值: {take_profit_threshold:.2%}, 回撤止损阈值: {drawdown_threshold:.2%}")
+                    print(f"开仓: 价格 {current_price:.2f}")
+                    print(f"- 初始止损: {initial_stop_loss:.2%} (价格{entry_price * (1 - initial_stop_loss):.2f})")
+                    print(f"- 初始止盈: {initial_take_profit:.2%} (价格{entry_price * (1 + initial_take_profit):.2f})")
+                    print(f"- 移动止损将在盈利{trailing_stop_activation:.2%}后激活")
 
                     # 记录买入点
                     self.trade_points.append({
@@ -592,8 +701,10 @@ class RealisticBacktester:
                         'price': current_price,
                         'type': 'buy',
                         'equity': current_total_value,
-                        'take_profit_threshold': take_profit_threshold,
-                        'drawdown_threshold': drawdown_threshold
+                        'initial_stop_loss': initial_stop_loss,
+                        'initial_take_profit': initial_take_profit,
+                        'trailing_stop_activation': trailing_stop_activation,
+                        'trailing_stop_distance': trailing_stop_distance
                     })
 
             # 记录当前时刻的权益曲线点
@@ -606,6 +717,8 @@ class RealisticBacktester:
             close_trade = self.execute_trade(0, final_price, capital, 0.5, 0.02, timestamps[-1])
             capital += position * final_price - close_trade['cost']
 
+            # 计算最终盈亏
+            final_return = (final_price - entry_price) / entry_price if entry_price > 0 else 0
             profit_loss = (final_price - entry_price) * position - close_trade['cost']
             profit_loss_pct = (profit_loss / (entry_price * position)) * 100 if entry_price > 0 else 0
 
@@ -619,7 +732,10 @@ class RealisticBacktester:
                 'equity': capital,
                 'trade_type': 'close_out',
                 'profit_loss': profit_loss,
-                'return_pct': profit_loss_pct
+                'return_pct': profit_loss_pct,
+                'current_return_at_exit': final_return,
+                'trailing_stop_activated': trailing_stop_activated,
+                'trailing_stop_price': trailing_stop_price if trailing_stop_activated else None
             })
 
         # ==================== 绩效指标计算 ====================
@@ -633,7 +749,7 @@ class RealisticBacktester:
             current_drawdown = (final_peak - value) / final_peak if final_peak > 0 else 0
             final_max_drawdown = max(final_max_drawdown, current_drawdown)
 
-        # 其他绩效指标计算保持不变...
+        # 其他绩效指标计算
         total_return = (capital - self.initial_capital) / self.initial_capital
         annual_return = total_return / (len(predictions) / 252) if len(predictions) > 0 else 0
 
@@ -666,23 +782,39 @@ class RealisticBacktester:
         drawdown_stop_count = len(self.drawdown_stop_trades)
         drawdown_stop_rate = drawdown_stop_count / total_trade_pairs if total_trade_pairs > 0 else 0
 
+        # 移动止损统计
+        trailing_stop_trades = [t for t in self.drawdown_stop_trades if t.get('stop_type') == 'trailing_stop']
+        fixed_stop_trades = [t for t in self.drawdown_stop_trades if t.get('stop_type') == 'fixed_stop']
+
+        trailing_stop_count = len(trailing_stop_trades)
+        fixed_stop_count = len(fixed_stop_trades)
+
         # ==================== 结果汇总 ====================
         results = {
             'initial_capital': self.initial_capital,
             'final_capital': capital,
             'total_return': total_return,
             'annual_return': annual_return,
-            'max_drawdown': final_max_drawdown,  # 使用重新计算的最大回撤
+            'max_drawdown': final_max_drawdown,
             'sharpe_ratio': sharpe_ratio,
             'total_trades': trades,
             'win_rate': win_rate,
             'take_profit_count': take_profit_count,
             'take_profit_rate': take_profit_rate,
-            'take_profit_threshold': take_profit_threshold,
             'drawdown_stop_count': drawdown_stop_count,
             'drawdown_stop_rate': drawdown_stop_rate,
-            'drawdown_threshold': drawdown_threshold,
-            'final_equity': self.equity_curve[-1] if self.equity_curve else self.initial_capital
+            'trailing_stop_count': trailing_stop_count,
+            'fixed_stop_count': fixed_stop_count,
+            'final_equity': self.equity_curve[-1] if self.equity_curve else self.initial_capital,
+
+            # 策略参数
+            'initial_stop_loss': initial_stop_loss,
+            'initial_take_profit': initial_take_profit,
+            'trailing_stop_activation': trailing_stop_activation,
+            'trailing_stop_distance': trailing_stop_distance,
+
+            # 动态止盈统计
+            'take_profit_thresholds_used': dynamic_take_profit_levels
         }
 
         # 打印回测结果摘要
@@ -690,9 +822,9 @@ class RealisticBacktester:
         return results
 
     def print_backtest_results(self, results: Dict[str, float]):
-        """打印基于回撤止损+止盈的回测结果"""
+        """打印基于分阶段止损止盈的回测结果"""
         print("\n" + "=" * 70)
-        print("基于回撤止损 + 6%止盈的回测结果")
+        print("基于分阶段止损止盈（趋势跟踪）的回测结果")
         print("=" * 70)
         print(f"初始资金: ${results['initial_capital']:,.2f}")
         print(f"最终资金: ${results['final_capital']:,.2f}")
@@ -702,12 +834,22 @@ class RealisticBacktester:
         print(f"夏普比率: {results['sharpe_ratio']:.2f}")
         print(f"总交易次数: {results['total_trades']}")
         print(f"胜率: {results['win_rate']:.2%}")
+
+        print(f"\n止盈统计:")
         print(f"止盈次数: {results['take_profit_count']}")
         print(f"止盈率: {results['take_profit_rate']:.2%}")
-        print(f"止盈阈值: {results['take_profit_threshold']:.2%}")
-        print(f"回撤止损次数: {results['drawdown_stop_count']}")
-        print(f"回撤止损率: {results['drawdown_stop_rate']:.2%}")
-        print(f"回撤止损阈值: {results['drawdown_threshold']:.2%}")
+
+        print(f"\n止损统计:")
+        print(f"总止损次数: {results['drawdown_stop_count']}")
+        print(f"固定止损次数: {results['fixed_stop_count']}")
+        print(f"移动止损次数: {results['trailing_stop_count']}")
+        print(f"止损率: {results['drawdown_stop_rate']:.2%}")
+
+        print(f"\n策略参数:")
+        print(f"初始止损: {results['initial_stop_loss']:.2%}")
+        print(f"初始止盈: {results['initial_take_profit']:.2%}")
+        print(f"移动止损激活: 盈利{results['trailing_stop_activation']:.2%}后启动")
+        print(f"移动止损距离: {results['trailing_stop_distance']:.2%}")
         print("=" * 70)
 
         # 打印止盈交易的详细信息
@@ -717,12 +859,32 @@ class RealisticBacktester:
             print(f"止盈交易平均收益率: {avg_take_profit:.2f}%")
             print(f"触发止盈时的平均收益率: {avg_return_at_take_profit:.2%}")
 
-        # 打印回撤止损交易的详细信息
+            # 统计移动止损使用情况
+            trailing_stop_used = [t for t in self.take_profit_trades if t.get('trailing_stop_activated', False)]
+            print(f"使用移动止损的止盈交易: {len(trailing_stop_used)}")
+
+        # 打印止损交易的详细信息
         if self.drawdown_stop_trades:
             avg_drawdown_stop = np.mean([t['profit_loss_pct'] for t in self.drawdown_stop_trades])
-            avg_drawdown_at_stop = np.mean([t['drawdown_at_stop'] for t in self.drawdown_stop_trades])
-            print(f"回撤止损平均亏损: {avg_drawdown_stop:.2f}%")
-            print(f"触发止损时的平均回撤: {avg_drawdown_at_stop:.2%}")
+            print(f"止损交易平均亏损: {avg_drawdown_stop:.2f}%")
+
+            # 分别统计固定止损和移动止损
+            if self.drawdown_stop_trades:
+                fixed_stop_losses = [t['profit_loss_pct'] for t in self.drawdown_stop_trades if
+                                     t.get('stop_type') == 'fixed_stop']
+                trailing_stop_losses = [t['profit_loss_pct'] for t in self.drawdown_stop_trades if
+                                        t.get('stop_type') == 'trailing_stop']
+
+                if fixed_stop_losses:
+                    avg_fixed_stop = np.mean(fixed_stop_losses)
+                    print(f"固定止损平均亏损: {avg_fixed_stop:.2f}%")
+
+                if trailing_stop_losses:
+                    avg_trailing_stop = np.mean(trailing_stop_losses)
+                    avg_return_at_trailing_stop = np.mean([t['current_return'] for t in self.drawdown_stop_trades if
+                                                           t.get('stop_type') == 'trailing_stop'])
+                    print(f"移动止损平均亏损: {avg_trailing_stop:.2f}%")
+                    print(f"移动止损时的平均收益率: {avg_return_at_trailing_stop:.2%}")
 
     def plot_backtest_results(self, prices: List[float], timestamps: List[datetime],
                               predictions: List[int] = None, save_path: str = None):
@@ -988,58 +1150,136 @@ class RealisticBacktester:
         return fig
 
 
-class EnhancedLSTMModel(nn.Module):
+class AttentionLSTMModel(nn.Module):
     """
-    增强版LSTM模型（替换原SimpleLSTMPredictor）
-    包含双向LSTM、注意力机制、批归一化等
+    带注意力机制的LSTM模型
     """
 
-    def __init__(self, input_size, hidden_size=128, num_layers=3, output_size=3, dropout_rate=0.3):
-        super(EnhancedLSTMModel, self).__init__()
+    def __init__(self, input_size, hidden_size=64, num_layers=2, output_size=3, dropout=0.3):
+        super(AttentionLSTMModel, self).__init__()
+
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-        # 批归一化层 - 修复：移除或修改批归一化
-        # self.batch_norm = nn.BatchNorm1d(input_size)
-
-        # 双向LSTM
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, bidirectional=True, dropout=dropout_rate)
-
-        # 注意力机制
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size * 2, 64),
-            nn.Tanh(),
-            nn.Linear(64, 1),
-            nn.Softmax(dim=1)
+        # LSTM层
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
         )
+
+        # 注意力层
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size * 2,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 层归一化 - 对batch大小不敏感
+        self.layernorm1 = nn.LayerNorm(hidden_size * 2)
+        self.layernorm2 = nn.LayerNorm(64)
 
         # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size * 2, 64),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.BatchNorm1d(64),  # 在分类器中保留批归一化
+            nn.Dropout(dropout),
+            nn.LayerNorm(64),  # 使用LayerNorm替代BatchNorm
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
+            nn.Dropout(dropout),
             nn.Linear(32, output_size)
         )
 
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重"""
+        for name, param in self.lstm.named_parameters():
+            if 'weight' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
+
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
     def forward(self, x):
-        # 修复：移除输入层的批归一化，因为输入是3D (batch, seq, features)
-        # 直接使用LSTM处理
-
         # LSTM层
-        lstm_out, (hidden, cell) = self.lstm(x)
+        lstm_out, _ = self.lstm(x)
 
-        # 注意力机制
-        attention_weights = self.attention(lstm_out)
-        context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+        # 注意力层
+        attn_output, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        attn_output = self.layernorm1(attn_output + lstm_out)  # 残差连接
+
+        # 池化：使用平均池化
+        context = attn_output.mean(dim=1)
 
         # 分类
-        out = self.classifier(context_vector)
-        return out
+        output = self.classifier(context)
+
+        return output
+
+
+# class EnhancedLSTMModel(nn.Module):
+#     """
+#     增强版LSTM模型（替换原SimpleLSTMPredictor）
+#     包含双向LSTM、注意力机制、批归一化等
+#     """
+#
+#     def __init__(self, input_size, hidden_size=128, num_layers=3, output_size=3, dropout_rate=0.3):
+#         super(EnhancedLSTMModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.num_layers = num_layers
+#
+#         # 批归一化层 - 修复：移除或修改批归一化
+#         # self.batch_norm = nn.BatchNorm1d(input_size)
+#
+#         # 双向LSTM
+#         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+#                             batch_first=True, bidirectional=True, dropout=dropout_rate)
+#
+#         # 注意力机制
+#         self.attention = nn.Sequential(
+#             nn.Linear(hidden_size * 2, 64),
+#             nn.Tanh(),
+#             nn.Linear(64, 1),
+#             nn.Softmax(dim=1)
+#         )
+#
+#         # 分类器
+#         self.classifier = nn.Sequential(
+#             nn.Linear(hidden_size * 2, 64),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.BatchNorm1d(64),  # 在分类器中保留批归一化
+#             nn.Linear(64, 32),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(32, output_size)
+#         )
+#
+#     def forward(self, x):
+#         # 修复：移除输入层的批归一化，因为输入是3D (batch, seq, features)
+#         # 直接使用LSTM处理
+#
+#         # LSTM层
+#         lstm_out, (hidden, cell) = self.lstm(x)
+#
+#         # 注意力机制
+#         attention_weights = self.attention(lstm_out)
+#         context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+#
+#         # 分类
+#         out = self.classifier(context_vector)
+#         return out
 
 
 class ImprovedTransformerPredictor(nn.Module):
@@ -1144,12 +1384,12 @@ class MultiModelPredictor:
 
         # 创建模型
         if model_type == 'lstm':
-            self.model = EnhancedLSTMModel(input_dim, **model_kwargs)  # 使用增强版LSTM
+            self.model = AttentionLSTMModel(input_dim, **model_kwargs)  # 使用增强版LSTM
         elif model_type == 'transformer':
             self.model = ImprovedTransformerPredictor(input_dim, **model_kwargs)
         elif model_type == 'ensemble':
             self.models = {
-                'lstm': EnhancedLSTMModel(input_dim, **model_kwargs.get('lstm', {})),
+                'lstm': AttentionLSTMModel(input_dim, **model_kwargs.get('lstm', {})),
                 'transformer': ImprovedTransformerPredictor(input_dim, **model_kwargs.get('transformer', {}))
             }
         else:
@@ -1171,48 +1411,79 @@ class MultiModelPredictor:
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
     def train_enhanced_lstm(self, train_loader, val_loader, num_epochs=100, learning_rate=0.001):
-        """增强版LSTM训练（替换原训练函数）"""
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # 设备选择
+        """改进的训练方法"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = self.model.to(device)
 
-        if self.model_type == 'ensemble':
-            model = self.models['lstm']
-        else:
-            model = self.model
+        # 1. 使用类别权重解决类别不平衡问题
+        # 从您的输出看：下跌: 768, 平稳: 1977, 上涨: 641
+        class_weights = torch.tensor([
+            1977 / 768,  # 下跌权重
+            1.0,  # 平稳权重
+            1977 / 641  # 上涨权重
+        ]).float().to(device)
 
-        model = model.to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-        # 带类别权重的损失函数
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([2, 1, 1.5]).to(device))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        # 2. 使用不同的优化器
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-4,
+            betas=(0.9, 0.999)
+        )
 
-        best_val_loss = float('inf')
-        patience = 20
+        # 3. 使用学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,  # 初始周期
+            T_mult=2,  # 周期倍增因子
+            eta_min=1e-5  # 最小学习率
+        )
+
+        # 4. 梯度累积
+        accumulation_steps = 4  # 每4个batch更新一次
+
+        best_val_accuracy = 0.0
+        patience = 15
         counter = 0
 
         for epoch in range(num_epochs):
             model.train()
             train_loss = 0.0
+            train_correct = 0
+            train_total = 0
 
-            for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+
+            for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-                optimizer.zero_grad()
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y.squeeze())
+
+                # 梯度累积
+                loss = loss / accumulation_steps
                 loss.backward()
 
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                train_loss += loss.item()
+                train_loss += loss.item() * accumulation_steps
 
-            # 验证
+                # 计算训练准确率
+                _, predicted = torch.max(outputs.data, 1)
+                train_total += batch_y.size(0)
+                train_correct += (predicted == batch_y.squeeze()).sum().item()
+
+            # 验证阶段
             model.eval()
             val_loss = 0.0
-            correct = 0
-            total = 0
+            val_correct = 0
+            val_total = 0
 
             with torch.no_grad():
                 for batch_X, batch_y in val_loader:
@@ -1222,27 +1493,35 @@ class MultiModelPredictor:
                     val_loss += loss.item()
 
                     _, predicted = torch.max(outputs.data, 1)
-                    total += batch_y.size(0)
-                    correct += (predicted == batch_y.squeeze()).sum().item()
+                    val_total += batch_y.size(0)
+                    val_correct += (predicted == batch_y.squeeze()).sum().item()
 
-            train_loss /= len(train_loader)
-            val_loss /= len(val_loader)
-            accuracy = 100 * correct / total
+            train_accuracy = train_correct / train_total
+            val_accuracy = val_correct / val_total
 
-            scheduler.step(val_loss)
+            # 更新学习率
+            scheduler.step()
 
-            if epoch % 10 == 0:
-                print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Acc = {accuracy:.2f}%')
+            # 打印训练信息
+            if epoch % 5 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f'Epoch {epoch:3d}: '
+                      f'Train Loss = {train_loss / len(train_loader):.4f}, '
+                      f'Train Acc = {train_accuracy:.4f}, '
+                      f'Val Loss = {val_loss / len(val_loader):.4f}, '
+                      f'Val Acc = {val_accuracy:.4f}, '
+                      f'LR = {current_lr:.6f}')
 
-            # 早停
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            # 早停策略
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                torch.save(model.state_dict(), 'best_lstm_model.pth')
                 counter = 0
-                torch.save(model.state_dict(), 'best_lstm_model.pth')  # 保存最佳模型
+                print(f'模型改进: {val_accuracy:.4f}')
             else:
                 counter += 1
                 if counter >= patience:
-                    print(f'Early stopping at epoch {epoch}')
+                    print(f'早停触发于 epoch {epoch}')
                     break
 
         # 加载最佳模型
@@ -1564,9 +1843,9 @@ class AdvancedTrendPredictor:
 
     def enhanced_model_comparison(self, features: np.ndarray, labels: np.ndarray, sequence_length=30):
         """
-        增强版模型比较（替换原函数）
+        模型比较 - 修复DataLoader问题
         """
-        print("运行增强模型比较...")
+        print("运行模型比较...")
 
         # 修复：确保features是2D数组
         if len(features.shape) > 2:
@@ -1590,8 +1869,12 @@ class AdvancedTrendPredictor:
             X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
         )
 
-        # 修复：创建正确的数据集，确保输入维度正确
-        # 直接使用TensorDataset，因为数据已经是序列格式
+        # 修复：确保batch_size不会太小
+        batch_size = 32
+        if len(X_train) < batch_size:
+            batch_size = min(16, len(X_train))
+
+        # 创建数据集
         train_dataset = torch.utils.data.TensorDataset(
             torch.FloatTensor(X_train),
             torch.LongTensor(y_train)
@@ -1605,35 +1888,60 @@ class AdvancedTrendPredictor:
             torch.LongTensor(y_test)
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        # 修复：设置drop_last=True避免最后一个batch太小
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True  # 丢弃最后一个不完整的batch
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False
+        )
 
-        # 训练增强LSTM模型
-        print("训练增强LSTM模型...")
-        lstm_model = EnhancedLSTMModel(
+        lstm_model = AttentionLSTMModel(
             input_size=features.shape[1],
-            hidden_size=128,
-            num_layers=3,
+            hidden_size=64,
+            num_layers=2,
             output_size=3,
-            dropout_rate=0.3
+            dropout=0.2
         )
 
         # 创建优化器和训练
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         lstm_model = lstm_model.to(device)
 
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([2, 1, 1.5]).to(device))
-        optimizer = torch.optim.AdamW(lstm_model.parameters(), lr=0.001, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        # 使用改进的训练方法
+        class_counts = [np.sum(y_train == 0), np.sum(y_train == 1), np.sum(y_train == 2)]
+        total_samples = sum(class_counts)
+        class_weights = torch.tensor([
+            total_samples / class_counts[0] if class_counts[0] > 0 else 1.0,
+            total_samples / class_counts[1] if class_counts[1] > 0 else 1.0,
+            total_samples / class_counts[2] if class_counts[2] > 0 else 1.0
+        ]).float().to(device)
+
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
         best_val_loss = float('inf')
-        patience = 20
+        patience = 15
         counter = 0
 
         for epoch in range(100):
             lstm_model.train()
             train_loss = 0.0
+            train_correct = 0
+            train_total = 0
 
             for batch_X, batch_y in train_loader:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device)
@@ -1648,11 +1956,16 @@ class AdvancedTrendPredictor:
 
                 train_loss += loss.item()
 
+                # 计算准确率
+                _, predicted = torch.max(outputs.data, 1)
+                train_total += batch_y.size(0)
+                train_correct += (predicted == batch_y).sum().item()
+
             # 验证
             lstm_model.eval()
             val_loss = 0.0
-            correct = 0
-            total = 0
+            val_correct = 0
+            val_total = 0
 
             with torch.no_grad():
                 for batch_X, batch_y in val_loader:
@@ -1662,23 +1975,25 @@ class AdvancedTrendPredictor:
                     val_loss += loss.item()
 
                     _, predicted = torch.max(outputs.data, 1)
-                    total += batch_y.size(0)
-                    correct += (predicted == batch_y).sum().item()
+                    val_total += batch_y.size(0)
+                    val_correct += (predicted == batch_y).sum().item()
 
             train_loss /= len(train_loader)
             val_loss /= len(val_loader)
-            accuracy = 100 * correct / total
+            train_accuracy = train_correct / train_total if train_total > 0 else 0
+            val_accuracy = val_correct / val_total if val_total > 0 else 0
 
             scheduler.step(val_loss)
 
             if epoch % 10 == 0:
-                print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Acc = {accuracy:.2f}%')
+                print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, '
+                      f'Train Acc = {train_accuracy:.4f}, Val Acc = {val_accuracy:.4f}')
 
             # 早停
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 counter = 0
-                torch.save(lstm_model.state_dict(), 'best_enhanced_lstm_model.pth')
+                torch.save(lstm_model.state_dict(), 'best_lstm_model.pth')
             else:
                 counter += 1
                 if counter >= patience:
@@ -1686,7 +2001,8 @@ class AdvancedTrendPredictor:
                     break
 
         # 加载最佳模型
-        lstm_model.load_state_dict(torch.load('best_enhanced_lstm_model.pth'))
+        if os.path.exists('best_lstm_model.pth'):
+            lstm_model.load_state_dict(torch.load('best_lstm_model.pth'))
 
         # 评估模型
         lstm_model.eval()
@@ -1701,8 +2017,8 @@ class AdvancedTrendPredictor:
                 test_total += batch_y.size(0)
                 test_correct += (predicted == batch_y).sum().item()
 
-        lstm_accuracy = test_correct / test_total
-        print(f"增强LSTM模型准确率: {lstm_accuracy:.4f}")
+        lstm_accuracy = test_correct / test_total if test_total > 0 else 0
+        print(f"LSTM模型准确率: {lstm_accuracy:.4f}")
 
         return lstm_model, lstm_accuracy
 
@@ -1743,7 +2059,7 @@ class AdvancedTrendPredictor:
             self.model = EnhancedIncrementalLearningModel(
                 features_array.shape[1],
                 model_type='ensemble',
-                lstm={'hidden_dim': 128, 'num_layers': 3, 'dropout_rate': 0.3},
+                lstm={'hidden_dim': 64, 'num_layers': 3, 'dropout_rate': 0.3},
                 transformer={'num_heads': 4, 'num_layers': 2}
             )
         else:
@@ -2009,11 +2325,10 @@ if __name__ == "__main__":
         model_types = ['lstm', 'transformer', 'ensemble']
         selected_model = 'lstm'  # 可以更改为 'transformer' 或 'ensemble'
 
-        # LSTM特定参数 - 使用增强参数
         lstm_kwargs = {
-            'hidden_size': 128,
-            'num_layers': 3,
-            'dropout_rate': 0.3
+            'hidden_size': 64,  # 减小隐藏层大小
+            'num_layers': 2,  # 减少层数
+            'dropout': 0.2  # 适度dropout
         }
 
         predictor = AdvancedTrendPredictor(

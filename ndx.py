@@ -3,7 +3,6 @@
 完整版：基于技术指标波动率的市场反转点预测系统
 包含Transformer和LSTM双模型支持
 改进版：提高模型准确率 - 增加回测可视化功能
-二分类版本：上涨(1) vs 非上涨(0)
 """
 
 # 导入必要的库
@@ -16,7 +15,7 @@ import yfinance as yf  # 雅虎财经数据下载
 import matplotlib.pyplot as plt  # 绘图
 import matplotlib.dates as mdates  # 日期格式化
 from sklearn.preprocessing import StandardScaler  # 数据标准化
-from sklearn.metrics import classification_report, confusion_matrix  # 分类报告和混淆矩阵
+from sklearn.metrics import classification_report  # 分类报告
 from sklearn.model_selection import TimeSeriesSplit  # 时间序列分割
 from sklearn.utils import resample  # 数据重采样
 import torch  # PyTorch深度学习框架
@@ -73,7 +72,7 @@ class RobustMarketDataset(Dataset):
         if label_idx < len(self.labels):
             label = self.labels[label_idx]  # 获取对应标签
         else:
-            label = 0  # 默认非上涨
+            label = 1  # 默认平稳
 
         # 返回特征序列和标签的张量
         return torch.FloatTensor(features_seq), torch.LongTensor([label])
@@ -91,7 +90,7 @@ class EfficientMarketDataProcessor:
         self.initial_period = initial_period
         self.data = None
         self.technical_cache = {}  # 技术指标缓存
-        self.volatility_windows = [20, 60]  # 波动率计算窗口
+        self.volatility_windows = [5, 12]  # 波动率计算窗口
 
     def fetch_data(self, period="2y", cache_dir="./data_cache"):
         """获取数据（带缓存）"""
@@ -227,7 +226,7 @@ class EfficientMarketDataProcessor:
 
             # 修复：确保布林带位置计算正确
             bb_position = (close - df_enhanced[f'BB_lower_{window}']) / (
-                    df_enhanced[f'BB_upper_{window}'] - df_enhanced[f'BB_lower_{window}'])
+                        df_enhanced[f'BB_upper_{window}'] - df_enhanced[f'BB_lower_{window}'])
             if isinstance(bb_position, pd.DataFrame):
                 bb_position = bb_position.squeeze()
             df_enhanced[f'BB_position_{window}'] = bb_position  # 价格在布林带中的位置
@@ -283,11 +282,11 @@ class EfficientMarketDataProcessor:
 
         return volatility_features
 
-    def create_enhanced_labels_binary(self, features_df: pd.DataFrame, price_data, lookforward_days=1):
+    def create_enhanced_labels(self, features_df: pd.DataFrame, price_data, lookforward_days=4):
         """
-        二分类标签生成：上涨(1) vs 非上涨(0)
+        增强版标签生成（替换原函数）
         """
-        print("创建二分类标签（上涨 vs 非上涨）...")
+        print("创建增强版智能标签...")
 
         # 提取收盘价数据
         if isinstance(price_data, pd.DataFrame):
@@ -305,7 +304,7 @@ class EfficientMarketDataProcessor:
         # 修复：确保 close_prices 是 numpy 数组
         close_prices = np.array(close_prices)
 
-        # 计算未来收益率
+        # 计算未来收益率 - 修复版本
         future_returns = []
         for i in range(len(close_prices) - lookforward_days):
             try:
@@ -336,16 +335,31 @@ class EfficientMarketDataProcessor:
         # 修复：确保 future_returns 是纯数值数组
         future_returns = np.array(future_returns, dtype=float)
 
-        # 创建二分类标签：0=非上涨，1=上涨
-        # 使用动态阈值：收益率超过0.5%视为上涨
+        # 使用动态阈值
+        valid_returns = future_returns[~np.isnan(future_returns)]
+
+        if len(valid_returns) > 0:
+            # 基于波动率的自适应阈值
+            volatility = np.std(valid_returns)
+            upper_threshold = volatility * 0.5  # 上涨阈值
+            lower_threshold = -volatility * 0.382  # 下跌阈值
+        else:
+            # 如果没有有效数据，使用默认阈值
+            upper_threshold = 0.005
+            lower_threshold = -0.005
+
+        # 创建标签：0=下跌, 1=平稳, 2=上涨
         labels = []
-        for ret in future_returns:
+        for index, ret in enumerate(future_returns):
             if np.isnan(ret):
-                labels.append(0)  # 默认非上涨
-            elif ret > 0.005:  # 0.5%作为上涨阈值
-                labels.append(1)  # 上涨
-            else:
-                labels.append(0)  # 非上涨
+                labels.append(1)  # 平稳作为默认值
+            if index > 0:
+                if future_returns[index-1] < 0 and ret > 0.005:
+                    labels.append(2)  # 上涨
+                elif future_returns[index-1] > 0 and ret < -0.005:
+                    labels.append(0)  # 下跌
+                else:
+                    labels.append(1)  # 平稳
 
         labels = np.array(labels)
 
@@ -354,8 +368,7 @@ class EfficientMarketDataProcessor:
         features_df = features_df.iloc[:min_length]
         labels = labels[:min_length]
 
-        print(f"二分类标签分布 - 非上涨(0): {np.sum(labels == 0)}, 上涨(1): {np.sum(labels == 1)}")
-        print(f"上涨比例: {np.sum(labels == 1) / len(labels):.2%}")
+        print(f"增强标签分布 - 下跌: {np.sum(labels == 0)}, 平稳: {np.sum(labels == 1)}, 上涨: {np.sum(labels == 2)}")
 
         return features_df, labels
 
@@ -411,7 +424,7 @@ class RealisticBacktester:
             price_value = float(price)
 
         # 应用滑点
-        execution_price = price_value * (1 + self.slippage) if signal == 1 else price_value * (1 - self.slippage)
+        execution_price = price_value * (1 + self.slippage) if signal == 2 else price_value * (1 - self.slippage)
 
         # 计算仓位大小
         position_size = self.calculate_position_size(current_capital, confidence, volatility)
@@ -426,7 +439,7 @@ class RealisticBacktester:
             'price': execution_price,
             'position_size': position_size,
             'cost': trade_cost,
-            'shares': position_size / execution_price if signal == 1 else 0  # 买入时计算股数
+            'shares': position_size / execution_price if signal == 2 else 0  # 买入时计算股数
         }
 
         self.trade_log.append(trade_record)
@@ -436,7 +449,7 @@ class RealisticBacktester:
                      prices: List[float], volatilities: List[float],
                      timestamps: List[datetime]) -> Dict[str, float]:
         """
-        运行分阶段止损止盈回测（趋势跟踪策略）- 二分类版本
+        运行分阶段止损止盈回测（趋势跟踪策略）
         """
         print("运行基于分阶段止损止盈（趋势跟踪）的回测...")
         print(f"预测列表长度: {len(predictions)}")
@@ -502,13 +515,8 @@ class RealisticBacktester:
 
             # 获取置信度
             if i < len(confidence_scores):
-                # 对于二分类，置信度是预测为上涨的概率
-                if hasattr(confidence_scores[i], '__len__'):
-                    # 如果是多维数组，取第二个元素（上涨的概率）
-                    if len(confidence_scores[i]) > 1:
-                        confidence = confidence_scores[i][1]
-                    else:
-                        confidence = confidence_scores[i][0] if predictions[i] == 1 else 1 - confidence_scores[i][0]
+                if hasattr(confidence_scores[i], '__len__') and len(confidence_scores[i]) > predictions[i]:
+                    confidence = confidence_scores[i][predictions[i]]
                 else:
                     confidence = 0.5
             else:
@@ -588,11 +596,11 @@ class RealisticBacktester:
                 current_return = 0
 
             # ==================== 交易信号处理 ====================
-            signal = predictions[i]  # 二分类：0=非上涨，1=上涨
-            prev_signal = predictions[i - 1] if i > 0 else 0
+            signal = predictions[i]
+            prev_signal = predictions[i - 1] if i > 0 else 1
 
             # 执行交易的标志（包括止盈止损触发）
-            should_trade = (signal != prev_signal and signal == 0) or take_profit_triggered or drawdown_stop_triggered
+            should_trade = (signal != prev_signal) or take_profit_triggered or drawdown_stop_triggered
 
             if should_trade and position > 0:
                 # 平仓逻辑
@@ -665,9 +673,9 @@ class RealisticBacktester:
                 trades += 1
                 position_direction = 0
 
-            # 开仓逻辑：预测为上涨时买入
-            if signal == 1 and position == 0 and capital > 0:
-                buy_trade = self.execute_trade(1, current_price, capital,
+            # 开仓逻辑
+            if signal == 2 and position == 0 and capital > 0:
+                buy_trade = self.execute_trade(2, current_price, capital,
                                                confidence, volatilities[i], current_timestamp)
                 if buy_trade['shares'] > 0:
                     position = buy_trade['shares']
@@ -883,6 +891,12 @@ class RealisticBacktester:
                               predictions: List[int] = None, save_path: str = None):
         """
         绘制回测结果图表 - 增强版，显示止盈点
+
+        参数:
+            prices: 价格序列
+            timestamps: 时间戳序列
+            predictions: 预测信号序列 (可选)
+            save_path: 图片保存路径 (可选)
         """
         if not self.equity_curve:
             print("警告: 没有回测数据可绘制")
@@ -935,9 +949,12 @@ class RealisticBacktester:
         if predictions is not None and len(predictions) == len(prices):
             # 创建信号背景色
             for i in range(1, len(predictions)):
-                if predictions[i] == 1:  # 买入信号
+                if predictions[i] == 2:  # 买入信号
                     ax1.axvspan(timestamps[i - 1], timestamps[i],
                                 alpha=0.1, color='green', label='买入信号' if i == 1 else "")
+                elif predictions[i] == 0:  # 卖出信号
+                    ax1.axvspan(timestamps[i - 1], timestamps[i],
+                                alpha=0.1, color='red', label='卖出信号' if i == 1 else "")
 
         ax1.legend(loc='upper left')
 
@@ -1031,7 +1048,7 @@ class RealisticBacktester:
         ax1.scatter(sell_dates_take_profit, sell_prices_take_profit, color='gold', marker='v', s=150,
                     label=f'止盈卖出 ({len(sell_dates_take_profit)})', zorder=6, edgecolors='orange', linewidth=2)
 
-        ax1.set_title('价格走势与交易点位 (包含止盈策略)', fontsize=14, fontweight='bold')
+        ax1.set_title('价格走势与交易点位 (包含6%止盈策略)', fontsize=14, fontweight='bold')
         ax1.set_ylabel('价格', fontsize=12)
         ax1.legend()
         ax1.grid(True, alpha=0.3)
@@ -1136,10 +1153,10 @@ class RealisticBacktester:
 
 class AttentionLSTMModel(nn.Module):
     """
-    带注意力机制的LSTM模型 - 二分类版本
+    带注意力机制的LSTM模型
     """
 
-    def __init__(self, input_size, hidden_size=128, num_layers=2, output_size=2, dropout=0.3):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, output_size=3, dropout=0.3):
         super(AttentionLSTMModel, self).__init__()
 
         self.hidden_size = hidden_size
@@ -1176,7 +1193,7 @@ class AttentionLSTMModel(nn.Module):
             nn.Linear(128, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(32, output_size)  # 输出2个类别
+            nn.Linear(32, output_size)
         )
 
         self._init_weights()
@@ -1212,9 +1229,63 @@ class AttentionLSTMModel(nn.Module):
         return output
 
 
+# class EnhancedLSTMModel(nn.Module):
+#     """
+#     增强版LSTM模型（替换原SimpleLSTMPredictor）
+#     包含双向LSTM、注意力机制、批归一化等
+#     """
+#
+#     def __init__(self, input_size, hidden_size=128, num_layers=3, output_size=3, dropout_rate=0.3):
+#         super(EnhancedLSTMModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.num_layers = num_layers
+#
+#         # 批归一化层 - 修复：移除或修改批归一化
+#         # self.batch_norm = nn.BatchNorm1d(input_size)
+#
+#         # 双向LSTM
+#         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+#                             batch_first=True, bidirectional=True, dropout=dropout_rate)
+#
+#         # 注意力机制
+#         self.attention = nn.Sequential(
+#             nn.Linear(hidden_size * 2, 64),
+#             nn.Tanh(),
+#             nn.Linear(64, 1),
+#             nn.Softmax(dim=1)
+#         )
+#
+#         # 分类器
+#         self.classifier = nn.Sequential(
+#             nn.Linear(hidden_size * 2, 64),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.BatchNorm1d(64),  # 在分类器中保留批归一化
+#             nn.Linear(64, 32),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(32, output_size)
+#         )
+#
+#     def forward(self, x):
+#         # 修复：移除输入层的批归一化，因为输入是3D (batch, seq, features)
+#         # 直接使用LSTM处理
+#
+#         # LSTM层
+#         lstm_out, (hidden, cell) = self.lstm(x)
+#
+#         # 注意力机制
+#         attention_weights = self.attention(lstm_out)
+#         context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+#
+#         # 分类
+#         out = self.classifier(context_vector)
+#         return out
+
+
 class ImprovedTransformerPredictor(nn.Module):
     """
-    改进的Transformer预测器，支持多种池化策略 - 二分类版本
+    改进的Transformer预测器，支持多种池化策略
     """
 
     def __init__(self, input_dim: int, num_heads: int = 4, num_layers: int = 2,
@@ -1237,12 +1308,12 @@ class ImprovedTransformerPredictor(nn.Module):
 
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 分类器 - 二分类
+        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(32, 16),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, 2)  # 2个类别：非上涨和上涨
+            nn.Linear(16, 3)  # 3个类别
         )
 
         self._init_weights()
@@ -1288,7 +1359,7 @@ class ImprovedTransformerPredictor(nn.Module):
             raise ValueError(f"Unknown pooling strategy: {self.pooling}")
 
         # 分类
-        output = self.classifier(x)  # (batch_size, 2)
+        output = self.classifier(x)  # (batch_size, 3)
 
         return output
 
@@ -1296,7 +1367,7 @@ class ImprovedTransformerPredictor(nn.Module):
 class MultiModelPredictor:
     """
     多模型预测器
-    支持Transformer和LSTM模型的选择和比较 - 二分类版本
+    支持Transformer和LSTM模型的选择和比较
     """
 
     def __init__(self, input_dim: int, model_type: str = 'lstm', **model_kwargs):
@@ -1314,12 +1385,12 @@ class MultiModelPredictor:
 
         # 创建模型
         if model_type == 'lstm':
-            self.model = AttentionLSTMModel(input_dim, output_size=2, **model_kwargs)  # 二分类
+            self.model = AttentionLSTMModel(input_dim, **model_kwargs)  # 使用增强版LSTM
         elif model_type == 'transformer':
             self.model = ImprovedTransformerPredictor(input_dim, **model_kwargs)
         elif model_type == 'ensemble':
             self.models = {
-                'lstm': AttentionLSTMModel(input_dim, output_size=2, **model_kwargs.get('lstm', {})),
+                'lstm': AttentionLSTMModel(input_dim, **model_kwargs.get('lstm', {})),
                 'transformer': ImprovedTransformerPredictor(input_dim, **model_kwargs.get('transformer', {}))
             }
         else:
@@ -1341,21 +1412,21 @@ class MultiModelPredictor:
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
     def train_enhanced_lstm(self, train_loader, val_loader, num_epochs=100, learning_rate=0.001):
-        """改进的训练方法 - 二分类版本"""
+        """改进的训练方法"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = self.model.to(device)
 
-        # 使用类别权重解决类别不平衡问题
-        # 假设我们知道类别分布，这里使用示例权重
-        # 实际应该根据训练数据计算
+        # 1. 使用类别权重解决类别不平衡问题
+        # 从您的输出看：下跌: 768, 平稳: 1977, 上涨: 641
         class_weights = torch.tensor([
-            1.0,  # 非上涨权重
-            2.0  # 上涨权重
+            5,  # 下跌权重
+            0.1,  # 平稳权重
+            5  # 上涨权重
         ]).float().to(device)
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-        # 使用不同的优化器
+        # 2. 使用不同的优化器
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=learning_rate,
@@ -1363,7 +1434,7 @@ class MultiModelPredictor:
             betas=(0.9, 0.999)
         )
 
-        # 使用学习率调度器
+        # 3. 使用学习率调度器
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
             T_0=10,  # 初始周期
@@ -1371,7 +1442,7 @@ class MultiModelPredictor:
             eta_min=1e-5  # 最小学习率
         )
 
-        # 梯度累积
+        # 4. 梯度累积
         accumulation_steps = 4  # 每4个batch更新一次
 
         best_val_accuracy = 0.0
@@ -1664,24 +1735,27 @@ def enhance_training_data(X_train, y_train):
     return np.vstack(X_augmented), np.hstack(y_augmented)
 
 
-def balance_dataset_binary(X, y):
-    """平衡二分类数据集"""
+def balance_dataset(X, y):
+    """平衡数据集"""
     # 分离各类别
     class_0 = X[y == 0]
     class_1 = X[y == 1]
+    class_2 = X[y == 2]
 
     # 找到最大类别大小
-    max_size = max(len(class_0), len(class_1))
+    max_size = max(len(class_0), len(class_1), len(class_2))
 
     # 上采样少数类别
     class_0_upsampled = resample(class_0, replace=True, n_samples=max_size, random_state=42)
     class_1_upsampled = resample(class_1, replace=True, n_samples=max_size, random_state=42)
+    class_2_upsampled = resample(class_2, replace=True, n_samples=max_size, random_state=42)
 
     # 合并
-    X_balanced = np.vstack([class_0_upsampled, class_1_upsampled])
+    X_balanced = np.vstack([class_0_upsampled, class_1_upsampled, class_2_upsampled])
     y_balanced = np.hstack([
         np.zeros(max_size),
-        np.ones(max_size)
+        np.ones(max_size),
+        np.full(max_size, 2)
     ])
 
     # 打乱数据
@@ -1691,7 +1765,7 @@ def balance_dataset_binary(X, y):
 
 class EnhancedIncrementalLearningModel:
     """
-    增强的增量学习模型 - 二分类版本
+    增强的增量学习模型
     支持LSTM和Transformer模型
     """
 
@@ -1756,7 +1830,7 @@ class EnhancedIncrementalLearningModel:
 
 class AdvancedTrendPredictor:
     """
-    高级趋势预测器 - 二分类版本
+    高级趋势预测器
     支持模型选择和比较
     """
 
@@ -1770,7 +1844,7 @@ class AdvancedTrendPredictor:
 
     def enhanced_model_comparison(self, features: np.ndarray, labels: np.ndarray, sequence_length=30):
         """
-        模型比较 - 修复DataLoader问题 - 二分类版本
+        模型比较 - 修复DataLoader问题
         """
         print("运行模型比较...")
 
@@ -1782,7 +1856,7 @@ class AdvancedTrendPredictor:
         X_sequences, y_sequences = create_sequences(features, labels, sequence_length)
 
         # 数据平衡
-        X_balanced, y_balanced = balance_dataset_binary(X_sequences, y_sequences)
+        X_balanced, y_balanced = balance_dataset(X_sequences, y_sequences)
 
         # 数据增强
         X_enhanced, y_enhanced = enhance_training_data(X_balanced, y_balanced)
@@ -1839,7 +1913,7 @@ class AdvancedTrendPredictor:
             input_size=features.shape[1],
             hidden_size=128,
             num_layers=2,
-            output_size=2,  # 二分类
+            output_size=3,
             dropout=0.2
         )
 
@@ -1848,11 +1922,12 @@ class AdvancedTrendPredictor:
         lstm_model = lstm_model.to(device)
 
         # 使用改进的训练方法
-        class_counts = [np.sum(y_train == 0), np.sum(y_train == 1)]
+        class_counts = [np.sum(y_train == 0), np.sum(y_train == 1), np.sum(y_train == 2)]
         total_samples = sum(class_counts)
         class_weights = torch.tensor([
             total_samples / class_counts[0] if class_counts[0] > 0 else 1.0,
-            total_samples / class_counts[1] if class_counts[1] > 0 else 1.0
+            total_samples / class_counts[1] if class_counts[1] > 0 else 1.0,
+            total_samples / class_counts[2] if class_counts[2] > 0 else 1.0
         ]).float().to(device)
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -1949,8 +2024,8 @@ class AdvancedTrendPredictor:
         return lstm_model, lstm_accuracy
 
     def run_advanced_pipeline(self, compare_models: bool = False):
-        """运行高级预测流程 - 修复版本 - 二分类版本"""
-        print("开始高级趋势预测流程（二分类：上涨 vs 非上涨）...")
+        """运行高级预测流程 - 修复版本"""
+        print("开始高级趋势预测流程...")
 
         # 1. 获取和处理数据
         data = self.data_processor.fetch_data(period="2y")
@@ -1968,11 +2043,11 @@ class AdvancedTrendPredictor:
                                                                        'price_position'])]
         features_df = all_features[feature_columns].dropna()
 
-        # 使用二分类标签生成
-        features_df, labels = self.data_processor.create_enhanced_labels_binary(features_df, data)
+        # 使用增强版标签生成
+        features_df, labels = self.data_processor.create_enhanced_labels(features_df, data)
 
         print(f"特征形状: {features_df.shape}")
-        print(f"标签分布: 非上涨(0): {np.sum(labels == 0)}, 上涨(1): {np.sum(labels == 1)}")
+        print(f"标签分布: {np.unique(labels, return_counts=True)}")
 
         # 3. 模型比较（可选）
         if compare_models:
@@ -1985,7 +2060,7 @@ class AdvancedTrendPredictor:
             self.model = EnhancedIncrementalLearningModel(
                 features_array.shape[1],
                 model_type='ensemble',
-                lstm={'hidden_size': 128, 'num_layers': 3, 'dropout': 0.3},
+                lstm={'hidden_dim': 128, 'num_layers': 3, 'dropout_rate': 0.3},
                 transformer={'num_heads': 4, 'num_layers': 2}
             )
         else:
@@ -2009,7 +2084,7 @@ class AdvancedTrendPredictor:
         return features_df, labels, all_features
 
     def train_with_incremental_learning(self, features: np.ndarray, labels: np.ndarray):
-        """使用增量学习训练模型 - 修复版本 - 二分类版本"""
+        """使用增量学习训练模型 - 修复版本"""
         print(f"使用{self.model_type.upper()}模型进行增量学习训练...")
 
         tscv = TimeSeriesSplit(n_splits=5)  # 时间序列交叉验证
@@ -2077,27 +2152,16 @@ class AdvancedTrendPredictor:
                     print(f"各折叠准确率: {[f'{acc:.4f}' for acc in fold_accuracies]}")
                     print(f"平均折叠准确率: {np.mean(fold_accuracies):.4f}")
 
-                # 计算混淆矩阵
-                cm = confusion_matrix(all_true_labels, all_predictions)
-                print(f"\n混淆矩阵:")
-                print(cm)
-
-                # 计算精确率、召回率、F1分数
-                from sklearn.metrics import precision_recall_fscore_support
-                precision, recall, f1, _ = precision_recall_fscore_support(all_true_labels, all_predictions,
-                                                                           average='binary')
-                print(f"精确率: {precision:.4f}")
-                print(f"召回率: {recall:.4f}")
-                print(f"F1分数: {f1:.4f}")
-
                 unique_labels = np.unique(np.concatenate([all_true_labels, all_predictions]))
                 print(f"实际出现的类别: {unique_labels}")
 
                 label_names = []
                 for label in sorted(unique_labels):
                     if label == 0:
-                        label_names.append('非上涨')
+                        label_names.append('下跌')
                     elif label == 1:
+                        label_names.append('平稳')
+                    elif label == 2:
                         label_names.append('上涨')
                     else:
                         label_names.append(f'类别{label}')
@@ -2113,9 +2177,10 @@ class AdvancedTrendPredictor:
 
         self.is_trained = True  # 标记模型已训练
 
+
     def run_realistic_backtest(self, features_df: pd.DataFrame, labels: np.ndarray,
                                full_data: pd.DataFrame):
-        """运行现实回测 - 修复价格数据提取问题 - 二分类版本"""
+        """运行现实回测 - 修复价格数据提取问题"""
         if not self.is_trained or self.model is None:
             print("模型未训练，无法进行回测")
             return
@@ -2254,7 +2319,7 @@ class AdvancedTrendPredictor:
 
 # 主程序
 if __name__ == "__main__":
-    print("启动多模型趋势预测系统（二分类：上涨 vs 非上涨）...")
+    print("启动多模型趋势预测系统...")
 
     try:
         # 可以选择不同的模型类型
@@ -2285,5 +2350,41 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"系统运行出错: {e}")
         import traceback
-
         traceback.print_exc()  # 打印详细错误信息
+
+# if __name__ == "__main__":
+#     # 可以选择不同的模型类型
+#     model_types = ['lstm', 'transformer', 'ensemble']
+#     selected_model = 'lstm'  # 可以更改为 'transformer' 或 'ensemble'
+#
+#     # LSTM特定参数 - 使用增强参数
+#     lstm_kwargs = {
+#         'hidden_size': 128,
+#         'num_layers': 3,
+#         'dropout_rate': 0.3
+#     }
+#
+#     predictor = AdvancedTrendPredictor(
+#         model_type=selected_model,
+#         **lstm_kwargs
+#     )
+#
+#     # 1. 获取和处理数据
+#     data = AdvancedTrendPredictor().data_processor.fetch_data(period="2y")
+#     tech_data = AdvancedTrendPredictor().data_processor.enhanced_calculate_technical_indicators(data)
+#     vol_features = AdvancedTrendPredictor().data_processor.calculate_volatility_features_vectorized(tech_data)
+#
+#     # 2. 合并特征和创建标签
+#     all_features = pd.concat([tech_data, vol_features], axis=1)
+#
+#     # 修复：更新特征列选择以匹配新的技术指标名称
+#     feature_columns = [col for col in all_features.columns if any(x in col for x in
+#                                                                   ['SMA', 'EMA', 'RSI', 'BB', 'volatility',
+#                                                                    'momentum', '_vol_', 'returns', 'log_returns',
+#                                                                    'price_ratio', 'ROC', 'volume', 'OBV',
+#                                                                    'price_position'])]
+#     features_df = all_features[feature_columns].dropna()
+#
+#     # 使用增强版标签生成
+#     features_df, labels = AdvancedTrendPredictor().data_processor.create_enhanced_labels(features_df, data)
+#     results = predictor.run_realistic_backtest(features_df, labels, data)

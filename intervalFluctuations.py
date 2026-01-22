@@ -9,7 +9,7 @@ class PriceDataCalculator:
         初始化计算器
 
         Args:
-            db: 数据库文件路径
+            _db: 数据库文件路径
             table_name: 表名
         """
         self.db_path = _db

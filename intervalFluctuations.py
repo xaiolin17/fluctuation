@@ -4,15 +4,15 @@ from tqdm import tqdm
 
 
 class PriceDataCalculator:
-    def __init__(self, db_path, table_name='Price'):
+    def __init__(self, _db, table_name='Price'):
         """
         初始化计算器
 
         Args:
-            db_path: 数据库文件路径
+            db: 数据库文件路径
             table_name: 表名
         """
-        self.db_path = db_path
+        self.db_path = _db
         self.table_name = table_name
         self.conn = None
         self.cursor = None
